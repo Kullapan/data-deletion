@@ -1,265 +1,133 @@
-# 🗑️ Yearly Data Deletion System
+# 🛡️ Enterprise Data Lifecycle Management: Deletion & Masking System
+### Secure Data Purging & PII Obfuscation Framework for PostgreSQL 16+
 
-ระบบลบข้อมูลประจำปีบน PostgreSQL อย่างปลอดภัย รองรับ Parent-Child หลายระดับ พร้อม Dry Run, Chunked Transactions และ Audit Trail
-
----
-
-## 📋 Quick Overview
-
-| Feature | Description |
-|---|---|
-| **Engine** | Pure PL/pgSQL Stored Procedures (PostgreSQL 16+) |
-| **Ingestion** | Python CLI รองรับทั้ง `.xlsx` และ `.csv` |
-| **Safety** | 2-Phase (Dry Run → Real Delete), Bottom-Up FK-safe, Micro-Transactions |
-| **Granular Control** | เลือกลบเฉพาะบางระดับของ Hierarchy ได้ (เช่น ลบเฉพาะ Grandchild) |
-| **Observability** | SQL Logging (`RAISE NOTICE`), Audit Log ราย Chunk |
-| **Scale** | หลักแสนรายการ, Chunk 500 keys/transaction, Throttle ระหว่าง Chunk |
+ระบบบริหารจัดการวงจรชีวิตข้อมูลระดับองค์กร (Data Lifecycle Management) บน PostgreSQL 16+ รองรับ 2 ภารกิจหลักตามกฎหมายคุ้มครองข้อมูลส่วนบุคคล (PDPA / GDPR):
+1. **🗑️ Data Deletion Subsystem**: การลบทำลายข้อมูลประจำปีแบบ Bottom-Up ป้องกัน Foreign Key Violation พร้อม Micro-Transactions
+2. **🎭 Data Masking Subsystem**: การแปลงข้อมูลส่วนบุคคล (PII Obfuscation) เฉพาะ Key ที่ระบุในไฟล์ Excel โดยกำหนดตรรกะการแปลงผ่านตารางคอนฟิก พร้อมระบบ Before/After Sample Preview
 
 ---
 
-## 🏗️ Architecture (2-Tier Item & Task Model)
+## 🧭 Subsystems Navigation (เข้าสู่ระบบย่อย)
 
 ```
-[Excel/CSV File (key_type, key_no)]
-       │
-       ▼
-[Python ingest.py] ──► [staging_deletion_item] (Master Keys)
-                              │
-               ┌──────────────┴──────────────┐
-               ▼ Task Expansion (1:N)        ▼
-      [staging_deletion_task] (Tasks per Table Group)
-               │                             │
-               ▼                             ▼
-      Phase 1: Dry Run              Phase 2: Real Delete
-      (NOT_FOUND / VALIDATED)       (Bottom-Up, chunked COMMIT)
-               │                             │
-               ▼                             ▼
-      [dry_run_summary]             [deletion_audit_log]
-      → ส่ง Ops อนุมัติ             → หลักฐาน Audit Trail
-```
-
----
-
-## 📁 Project Structure
-
-```
-data-deletion/
-├── docker/                          # Docker Environment
-│   ├── docker-compose.yml           # PostgreSQL 16 + pgAdmin 4
-│   └── init/                        # Auto-run on first start
-│       ├── 01_create_framework.sql  # Framework tables
-│       ├── 02_create_mock_tables.sql# Mock: orders → items → logs
-│       ├── 03_seed_mock_data.sql    # 10K/30K/60K rows + Rules
-│       └── 04_create_procedures.sql # Dry Run & Real Delete procedures
+data-lifecycle/ (root)
+├── docs/
+│   ├── deletion/                     # 📖 คู่มือและสเปกของระบบ Data Deletion
+│   │   ├── README.md                 # Deletion Quickstart & Index
+│   │   ├── TECHNICAL_SPEC.md         # Full Technical Specification (Deletion)
+│   │   ├── OPERATIONAL_MANUAL.md     # SOP ขั้นตอนปฏิบัติงานรายปี (Deletion)
+│   │   ├── CONFIG_USE_CASES_GUIDE.md # คู่มือคอนฟิก 6 Use Cases (Deletion)
+│   │   └── PERFORMANCE_REPORT_1M_100K.md # Benchmark 1M Records / 100K Keys
+│   └── masking/                      # 📖 คู่มือและสเปกของระบบ Data Masking
+│       ├── README.md                 # Masking Quickstart & Index
+│       ├── TECHNICAL_SPEC.md         # Full Technical Specification (Masking)
+│       ├── OPERATIONAL_MANUAL.md     # SOP & DPO Review Runbook (Masking)
+│       └── CONFIG_GUIDE.md           # คู่มือการเขียน mask_expression ในตารางคอนฟิก
 │
-├── sql/                             # Production SQL Scripts
-│   ├── 01_core_schema.sql           # Framework schema (2-Tier architecture)
-│   ├── 02_dry_run.sql               # Procedure: run_data_deletion_dry_run
-│   ├── 03_real_deletion.sql         # Procedure: run_data_deletion
-│   ├── 04_preflight_checks.sql      # Safety checks (FK Index, CASCADE)
-│   ├── 05_report_verify_dry_run.sql # Verification reports for Dry Run (Target Table level)
-│   ├── 06_report_verify_real_deletion.sql # Verification reports for Real Deletion (Target Table level)
-│   └── 07_example_configurations.sql# Enterprise configuration examples for 6 use cases
+├── sql/
+│   ├── deletion/                     # 🐘 Production SQL Scripts สำหรับ Deletion
+│   │   ├── 01_core_schema.sql        # Schema Framework (Groups, Rules, Staging, Audit)
+│   │   ├── 02_dry_run.sql            # Procedure: run_data_deletion_dry_run
+│   │   ├── 03_real_deletion.sql      # Procedure: run_data_deletion
+│   │   ├── 04_preflight_checks.sql   # FK Index & Cascade Safety Checks
+│   │   ├── 05_report_verify_dry_run.sql # Verification reports (Dry Run)
+│   │   ├── 06_report_verify_real_deletion.sql # Audit reports (Real Deletion)
+│   │   └── 07_example_configurations.sql # ตัวอย่าง Configuration 6 Use Cases
+│   └── masking/                      # 🐘 Production SQL Scripts สำหรับ Masking
+│       ├── 01_masking_schema.sql     # Schema Framework (Groups, Rules, Staging, Audit)
+│       ├── 02_masking_functions.sql  # คลังฟังก์ชัน Masking (Email, Phone, ID, Hash)
+│       ├── 03_masking_dry_run.sql    # Procedure: run_data_masking_dry_run (Sample Preview)
+│       ├── 04_masking_real.sql       # Procedure: run_data_masking (Chunked UPDATE)
+│       ├── 05_preflight_checks.sql   # Unique Index & Column Length Checks
+│       ├── 06_report_verify_dry_run.sql # Verification reports (Sample Previews)
+│       ├── 07_report_verify_real_masking.sql # Audit reports (Real Masking)
+│       └── 08_example_configurations.sql # ตัวอย่างการตั้งค่า Masking Rules
 │
-├── docs/                            # Comprehensive Documentation
-│   ├── CONFIG_USE_CASES_GUIDE.md    # Guide for configuring groups & rules across use cases
-│   ├── OPERATIONAL_MANUAL.md        # SOP, checklists, disaster recovery & verification reports
-│   ├── TECHNICAL_SPEC.md            # Technical specification, sequence diagram & architecture
-│   └── PERFORMANCE_REPORT_1M_100K.md# Benchmark report (1M records, 100K Excel keys)
-│
-├── scripts/                         # Python Tools
-│   ├── ingest.py                    # CSV/XLSX → staging_deletion_item
-│   └── requirements.txt             # pandas, openpyxl, psycopg2-binary
-│
-├── mock_data/                       # Test Data
-│   └── sample_keys.csv              # 2,000 sample keys (ORD-00001 ~ ORD-02000)
-│
-└── README.md                        # ← You are here
+└── scripts/
+    ├── deletion/                     # 🐍 Python Tools สำหรับ Deletion
+    │   ├── ingest.py                 # Ingest Excel/CSV เข้าสู่ staging_deletion_item
+    │   ├── test_pipeline.py          # E2E Regression Test Pipeline (Deletion)
+    │   ├── test_multi_group.py       # Multi-Group Task Expansion Test
+    │   └── perf_test_1m_100k.py      # Benchmark Suite 1M แถว
+    └── masking/                      # 🐍 Python Tools สำหรับ Masking
+        ├── ingest.py                 # Ingest Excel/CSV เข้าสู่ staging_masking_item
+        └── test_masking_pipeline.py  # E2E Automated Test Pipeline (Masking)
 ```
 
 ---
 
-## 🚀 Quick Start
+## ⚖️ Architectural Comparison: Deletion vs. Masking
 
-### 1. Start Docker Environment
-
-```bash
-cd docker
-docker compose up -d
-```
-
-| Service | URL | Credentials |
+| มิติการเปรียบเทียบ | 🗑️ Data Deletion System | 🎭 Data Masking System |
 |---|---|---|
-| **PostgreSQL** | `localhost:5432` | `postgres` / `password123` / `deletion_db` |
-| **pgAdmin** | http://localhost:5050 | `admin@admin.com` / `admin` |
+| **คำสั่ง SQL หลัก** | `DELETE FROM table WHERE ...` (Row-level removal) | `UPDATE table SET col = expr WHERE ...` (Column-level transformation) |
+| **ผลลัพธ์ต่อข้อมูล** | แถวข้อมูลถูกลบถาวร (Hard Delete) | แถวข้อมูลยังคงอยู่ แต่ค่า PII ถูกบดบังถาวร (Zero Deletions) |
+| **การควบคุมขอบเขต** | ตาม Master Keys ในไฟล์ Excel/CSV | **เฉพาะระเบียนที่ตรงกับ Key ใน Excel/CSV เท่านั้น** (Key-Driven) |
+| **ตรรกะการแปลงข้อมูล** | ไม่มีการแปลง (ลบทั้งแถว) | **กำหนดผ่านตารางคอนฟิก (`masking_rule.mask_expression`)** |
+| **ลำดับการประมวลผล** | **Bottom-Up** (ตารางลูกสุด $\rightarrow$ แม่) ป้องกัน FK Violation | **Composite Multi-Column** (รวมทุกคอลัมน์ของตารางใน 1 UPDATE) |
+| **จุดเด่นของ Dry Run** | คำนวณยอดแถวที่คาดว่าจะถูกลบ | **สร้าง Before / After Sample Preview (JSONB) ให้ DPO ตรวจสอบ** |
+| **การทำ Micro-Transaction** | `FOR UPDATE SKIP LOCKED LIMIT chunk_size` + COMMIT | `FOR UPDATE SKIP LOCKED LIMIT chunk_size` + COMMIT |
+| **Audit Trail** | `deletion_audit_log` | `masking_audit_log` |
 
-> Mock data (10K orders, 30K items, 60K logs) และ Stored Procedures จะถูกสร้างให้อัตโนมัติ
+---
 
-### 2. Install Python Dependencies
+## ⚡ Quick Operational Cheat Sheet
+
+### 1. 🗑️ Data Deletion Workflow
+```bash
+# 1. Ingest Master Keys จากไฟล์ Excel/CSV
+python scripts/deletion/ingest.py --file mock_data/sample_keys.csv --batch DEL-2025 --key-type ORDER_NO
+```
+```sql
+-- 2. Analytical Dry Run (จำลองการลบ)
+CALL run_data_deletion_dry_run('DEL-2025');
+SELECT * FROM deletion_dry_run_summary WHERE batch_id = 'DEL-2025';
+
+-- 3. Real Deletion (ลบจริงแบบ Chunked)
+CALL run_data_deletion('DEL-2025');
+SELECT target_table, SUM(deleted_row_count) FROM deletion_audit_log WHERE batch_id = 'DEL-2025' GROUP BY target_table;
+```
+
+---
+
+### 2. 🎭 Data Masking Workflow
+```bash
+# 1. Ingest Masking Keys จากไฟล์ Excel/CSV (เฉพาะ Key ที่ต้องการแปลงข้อมูล)
+python scripts/masking/ingest.py --file mock_data/pdpa_keys.xlsx --batch MASK-2026 --key-type CUSTOMER_ID
+```
+```sql
+-- 2. Analytical Dry Run (จำลองพร้อมสร้าง Before/After Preview)
+CALL run_data_masking_dry_run('MASK-2026');
+
+-- 3. DPO ตรวจสอบตัวอย่างก่อน/หลังการแปลงข้อมูล
+SELECT target_table, column_name, mask_expression, sample_preview 
+FROM masking_dry_run_summary WHERE batch_id = 'MASK-2026';
+
+-- 4. Real Masking (แปลงข้อมูลจริงทีละ Chunk ตามตรรกะในตารางคอนฟิก)
+CALL run_data_masking('MASK-2026');
+SELECT target_table, columns_masked, SUM(masked_row_count) FROM masking_audit_log WHERE batch_id = 'MASK-2026' GROUP BY target_table, columns_masked;
+```
+
+---
+
+## 🧪 Automated Testing & Verification
+
+รันชุดทดสอบอัตโนมัติ End-to-End ครบวงจรสำหรับทั้งสองระบบ:
 
 ```bash
-pip install -r scripts/requirements.txt
-```
+# ทดสอบระบบ Data Deletion
+python scripts/deletion/test_pipeline.py
 
-### 3. Ingest Keys
- 
-```bash
-# จาก CSV หรือ Excel ที่มีคอลัมน์ key_type และ key_no อยู่แล้ว (Auto-detect)
-python scripts/ingest.py --file data.xlsx --batch BATCH-2025
+# ทดสอบระบบ Data Masking
+python scripts/masking/test_masking_pipeline.py
 
-# หรือระบุ --key-type สำหรับไฟล์ที่มีคอลัมน์เดียว
-python scripts/ingest.py --file mock_data/sample_keys.csv --batch BATCH-2025 --key-type ORDER_NO
-```
-
-### 4. Dry Run (จำลอง ไม่ลบจริง)
-
-```sql
--- [แนะนำ] รันจำลองทุกกลุ่มงานใน Batch นี้ในคำสั่งเดียว (All Groups in One Command):
-CALL run_data_deletion_dry_run('BATCH-2025');
-
--- หรือระบุเฉพาะกลุ่มเจาะจง:
-CALL run_data_deletion_dry_run('BATCH-2025', 'ORDERS');
-
--- ดูผลลัพธ์
-SELECT group_code, target_table, execution_order, estimated_rows_to_delete 
-FROM deletion_dry_run_summary 
-WHERE batch_id = 'BATCH-2025' 
-ORDER BY group_code, execution_order;
-```
-
-### 5. Real Delete
-
-```sql
--- [แนะนำ] สั่งลบทุกกลุ่มงานใน Batch นี้ในคำสั่งเดียว (All Groups in One Command):
-CALL run_data_deletion('BATCH-2025');
-
--- หรือสั่งลบเฉพาะกลุ่มเจาะจง:
-CALL run_data_deletion('BATCH-2025', 'ORDERS');
-
--- หรือสั่งลบเฉพาะบางระดับ (Granular Mode):
-CALL run_data_deletion('BATCH-2025', 'ORDERS', 1);  -- เฉพาะ Grandchild
-CALL run_data_deletion('BATCH-2025', 'ORDERS', 2);  -- ถึง Child
-```
-
-### 6. Post-Maintenance
-
-```sql
-VACUUM ANALYZE orders;
-VACUUM ANALYZE order_items;
-VACUUM ANALYZE order_item_logs;
+# ทดสอบ Backward-Compatibility Shims ที่ Root
+python scripts/test_pipeline.py
 ```
 
 ---
 
-## 🔧 Configuration Guide
+## 📖 Detailed Documentation
 
-### Step 1: Create Deletion Group
-
-```sql
-INSERT INTO deletion_group (group_code, description, chunk_size, throttle_sec)
-VALUES ('MY_GROUP', 'Description here', 500, 0.05);
-```
-
-| Parameter | Recommended | When |
-|---|---|---|
-| `chunk_size` = 200–500 | ข้อมูลหลักหมื่น | สมดุล Speed/Load |
-| `chunk_size` = 500–1000 | ข้อมูลหลักแสน | เพิ่ม Throughput |
-| `throttle_sec` = 0.05 | มี Read Replica | ให้ Replica ตามทัน |
-| `throttle_sec` = 0 | ไม่มี Replica | ลบเร็วสุด |
-
-### Step 2: Define Deletion Rules (Bottom-Up)
-
-`$1` ใน template = Array ของ Parent Key จาก Staging
-
-```sql
--- ตัวอย่าง: 3-level hierarchy
-INSERT INTO deletion_rule (group_code, target_table, execution_order, where_clause_template)
-VALUES
-  ('ORDERS', 'order_item_logs', 1, 'WHERE item_id IN (SELECT id FROM order_items WHERE order_no = ANY($1))'),
-  ('ORDERS', 'order_items',     2, 'WHERE order_no = ANY($1)'),
-  ('ORDERS', 'orders',          3, 'WHERE order_no = ANY($1)');
-```
-
-> ⚠️ `execution_order` ต้องเรียงจาก **ลูกสุด (1) ไปหา Parent (N)** เสมอ
-
----
-
-## 📊 Status Flow
-
-```
-PENDING ──► NOT_FOUND          (Key ไม่พบในตาราง Parent)
-   │
-   └──► VALIDATED ──► COMPLETED           (ลบสำเร็จครบทุกระดับ)
-                  ──► PARTIAL_COMPLETED    (ลบสำเร็จบางระดับ / Granular)
-                  ──► FAILED              (เกิด Error → Stop the World)
-```
-
----
-
-## 🛡️ Safety Features
-
-| Feature | How |
-|---|---|
-| **Bottom-Up Delete** | ลบ Grandchild → Child → Parent ตามลำดับ ป้องกัน FK Violation |
-| **Micro-Transaction** | 1 Chunk = 1 COMMIT ถ้า Chunk พัง Rollback เฉพาะ Chunk นั้น |
-| **Stop the World** | เจอ Error → หยุดทันที → DBA/Ops เข้ามาดูก่อน |
-| **Resumable** | สั่ง `CALL run_data_deletion(...)` ซ้ำ ระบบทำต่อจาก VALIDATED ที่เหลือ |
-| **Unified Template** | COUNT และ DELETE ใช้ WHERE clause เดียวกัน → ไม่มีทางได้ผลต่างกัน |
-| **SQL Logging** | พิมพ์ SQL จริงทุก Chunk ผ่าน `RAISE NOTICE` |
-| **No Temp Table** | ใช้ PL/pgSQL Array ตัวแปร ไม่สร้าง Temp Table ป้องกัน Catalog Bloat |
-
----
-
-## 📖 Documentation & Guides
-
-| Document | Description |
-|---|---|
-| **[docs/TECHNICAL_SPEC.md](docs/TECHNICAL_SPEC.md)** | **Full Technical Specification** — สถาปัตยกรรมระบบ, ER Diagrams (Mermaid), State Machine, Schema Reference ละเอียดทุกตาราง |
-| **[docs/OPERATIONAL_MANUAL.md](docs/OPERATIONAL_MANUAL.md)** | **Operational Manual (SOP)** — ขั้นตอนปฏิบัติงานรายปี, Pre-flight Checks, การ Monitor ผ่าน SQL, และ Disaster Recovery |
-| **[scripts/test_pipeline.py](scripts/test_pipeline.py)** | **Automated Test Pipeline** — รันการทดสอบ Regression End-to-End ครบวงจรแบบคำสั่งเดียว |
-| **[sql/01_core_schema.sql](sql/01_core_schema.sql)** | Production schema — `CREATE TABLE IF NOT EXISTS` สำหรับ deploy จริง |
-| **[sql/02_dry_run.sql](sql/02_dry_run.sql)** | Source code: `run_data_deletion_dry_run` procedure |
-| **[sql/03_real_deletion.sql](sql/03_real_deletion.sql)** | Source code: `run_data_deletion` procedure |
-| **[sql/04_preflight_checks.sql](sql/04_preflight_checks.sql)** | Pre-flight queries: ตรวจ Missing FK Index, CASCADE constraints |
-| **[scripts/ingest.py](scripts/ingest.py)** | Python CLI สำหรับ Ingest Excel/CSV |
-| **[docker/docker-compose.yml](docker/docker-compose.yml)** | Docker environment สำหรับทดสอบ (PostgreSQL 16 + pgAdmin 4) |
-
----
-
-## ⚡ Command Cheat Sheet
-
-```bash
-# Docker
-cd docker && docker compose up -d          # Start
-cd docker && docker compose down           # Stop
-cd docker && docker compose down -v        # Stop + Delete data
-
-# Ingest
-python scripts/ingest.py --file <file> --batch <BATCH-ID> --group <GROUP>
-
-# SQL (via Docker)
-docker exec deletion_postgres psql -U postgres -d deletion_db -c "<SQL>"
-```
-
-```sql
--- Dry Run (All Groups in One Command)
-CALL run_data_deletion_dry_run('BATCH-YYYY');
--- Dry Run (Specific Group)
-CALL run_data_deletion_dry_run('BATCH-YYYY', 'GROUP_CODE');
-
--- Real Delete (All Groups in One Command)
-CALL run_data_deletion('BATCH-YYYY');
--- Real Delete (Specific Group)
-CALL run_data_deletion('BATCH-YYYY', 'GROUP_CODE');
--- Real Delete (Granular)
-CALL run_data_deletion('BATCH-YYYY', 'GROUP_CODE', 1);   -- Grandchild only
-CALL run_data_deletion('BATCH-YYYY', 'GROUP_CODE', 2);   -- up to Child
-
--- Check Results
-SELECT * FROM deletion_dry_run_summary WHERE batch_id = 'BATCH-YYYY';
-SELECT status, COUNT(*) FROM staging_deletion_item WHERE batch_id = 'BATCH-YYYY' GROUP BY status;
-SELECT target_table, SUM(deleted_row_count) FROM deletion_audit_log WHERE batch_id = 'BATCH-YYYY' GROUP BY target_table;
-
--- Post-Maintenance
-VACUUM ANALYZE <table_name>;
-```
+- **Data Deletion Subsystem**: [docs/deletion/README.md](docs/deletion/README.md)
+- **Data Masking Subsystem**: [docs/masking/README.md](docs/masking/README.md)
