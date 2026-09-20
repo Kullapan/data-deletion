@@ -1,0 +1,101 @@
+# =============================================
+# Python
+# =============================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env
+ENV/
+env.bak/
+venv.bak/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# =============================================
+# Environment & Secrets
+# =============================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# =============================================
+# IDE & Editors
+# =============================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# =============================================
+# Operating System
+# =============================================
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+
+# =============================================
+# Test Artifacts & Generated Large Benchmark Data
+# =============================================
+*.log
+mock_data/perf_keys_*.xlsx
+mock_data/perf_keys_*.csv
+mock_data/pipeline_test_keys.csv
+mock_data/test_*.xlsx
+mock_data/test_*.csv
+
+# Keep sample reference data
+!mock_data/sample_keys.csv
+
+# =============================================
+# Database / Docker Volume Dumps
+# =============================================
+*.dump
+*.sql.gz
+*.tar.gz
