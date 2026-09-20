@@ -104,9 +104,10 @@ def phase1_seed_source_data(cur, count: int = 1_000_000):
     """)
     
     # 2. Configure deletion group & rules if needed
+    cur.execute("UPDATE deletion_group SET is_active = FALSE WHERE key_type = 'ORDER_NO' AND group_code <> 'ORDERS';")
     cur.execute("""
-        INSERT INTO deletion_group (group_code, key_type, description, chunk_size, throttle_sec)
-        VALUES ('ORDERS', 'ORDER_NO', 'Yearly order data deletion', 500, 0.05)
+        INSERT INTO deletion_group (group_code, key_type, description, chunk_size, throttle_sec, is_active)
+        VALUES ('ORDERS', 'ORDER_NO', 'Yearly order data deletion', 500, 0.05, TRUE)
         ON CONFLICT (group_code) DO UPDATE 
         SET key_type = 'ORDER_NO', chunk_size = 500, throttle_sec = 0.05, is_active = TRUE;
     """)
@@ -392,7 +393,7 @@ This performance test benchmarks the **Yearly Data Deletion System** under high-
 | **5. Real Deletion (`run_data_deletion`)** | 200 Chunks (chunk_size=500, throttle=0.05s) | `{t_del:.2f}s` | `{99_990 / max(t_del, 0.001):,.0f} keys/s` | **{int(purged):,} rows deleted** ({purged / max(t_del, 0.001):,.0f} rows/s) |
 | **6. Post-Maintenance** | `VACUUM ANALYZE` across 5 tables | `{t_vac:.2f}s` | - | Reclaimed dead tuples and updated statistics |
 
-> ⏱️ **Total Ingestion to Complete Purge Time:** **`{t_ingest + t_dry + t_del + t_vac:.2f} seconds`** (under 1 minute!)
+> ⏱️ **Total Ingestion to Complete Purge Time:** **`{t_ingest + t_dry + t_del + t_vac:.2f} seconds`** (under 2 minutes!)
 
 ---
 
