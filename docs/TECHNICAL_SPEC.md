@@ -1,16 +1,17 @@
 # Technical Specification: Yearly Data Deletion System
-### Version 1.0 | PostgreSQL 16 | 2026-09-20
+### Version 2.0 | 2-Tier Item & Task Architecture | PostgreSQL 16 | 2026-09-20
 
 ---
 
 ## 1. System Overview
 
-ระบบ **Yearly Data Deletion** ออกแบบมาเพื่อลบข้อมูลที่ปิดรอบบัญชีประจำปีจากฐานข้อมูล PostgreSQL อย่างปลอดภัย โดยรองรับ:
-- ข้อมูลที่มีความสัมพันธ์แบบ Parent-Child หลายระดับ (Multi-level Hierarchy)
-- ข้อมูลหลักแสนรายการต่อปี
-- การลบแบบ Micro-Transaction (ทีละ Chunk) ไม่ Lock ทั้ง Table
-- Dry Run เพื่อจำลองผลลัพธ์ก่อนลบจริง
-- Audit Trail สำหรับการตรวจสอบย้อนหลัง
+ระบบ **Yearly Data Deletion** ออกแบบมาเพื่อลบข้อมูลที่ปิดรอบบัญชีประจำปีจากฐานข้อมูล PostgreSQL อย่างปลอดภัยตามมาตรฐาน Enterprise และข้อกำหนดการกำกับดูแลข้อมูล (PDPA / Right to be Forgotten) โดยรองรับ:
+- **สถาปัตยกรรม 2-Tier (Master Items & Group Tasks)**: แยกตัวตนของ Key จากภายนอก (`key_type`) ออกจากชุดตารางที่ต้องลบภายใน (`group_code`)
+- **ความสัมพันธ์แบบ 1 : N (Multi-Group Deletion)**: 1 Identifier (เช่น `CUSTOMER_ID`) สามารถกระจายงานไปลบหลายกลุ่มตารางได้พร้อมกัน (เช่น Orders, Invoices, Profiles)
+- **Bottom-Up FK-Safe**: ลบจากตารางลูกสุดไปหาตารางหลัก ป้องกัน Foreign Key Violation
+- **Micro-Transactions & High Throughput**: แบ่งการลบเป็น Chunk ย่อย (เช่น 500–1,000 keys) พร้อม COMMIT ราย Chunk
+- **2-Phase Safety**: ตรวจสอบความถูกต้องและจำลองตัวเลข (Analytical Dry Run) ให้ผู้อนุมัติลงนามก่อนลบจริง
+- **Observability & Audit Trail**: บันทึกประวัติการลบราย Chunk ลงใน `deletion_audit_log` พร้อมสถานะแบบเรียลไทม์
 
 ---
 
@@ -19,51 +20,123 @@
 ```mermaid
 flowchart TB
     subgraph INPUT["📥 Data Input Layer"]
-        EXCEL["Excel (.xlsx)"]
-        CSV["CSV (.csv)"]
+        EXCEL["Excel (.xlsx)<br/>(Columns: key_type, key_no)"]
+        CSV["CSV (.csv)<br/>(Columns: key_type, key_no)"]
     end
 
     subgraph PYTHON["🐍 Python Ingestion Layer"]
-        INGEST["ingest.py<br/>• Read file (streaming)<br/>• Force String type<br/>• Trim whitespace<br/>• Deduplicate<br/>• Bulk INSERT"]
+        INGEST["ingest.py<br/>• Auto-detect key_type & key_no<br/>• String sanitization & Trim<br/>• In-file Deduplication<br/>• Bulk INSERT into Master Items"]
     end
 
     subgraph DB["🐘 PostgreSQL Engine"]
-        STAGING["staging_deletion_item<br/>status: PENDING"]
+        STG_ITEM["📥 staging_deletion_item<br/>(Master Keys: batch_id, key_type, key_no)"]
 
         subgraph PHASE1["Phase 1: Analytical Dry Run"]
-            VALIDATE["Validate Keys<br/>• Check NOT_FOUND<br/>• Mark VALIDATED"]
-            COUNT["Count Affected Rows<br/>per target table"]
-            SUMMARY["deletion_dry_run_summary<br/>เก็บตัวเลขจำลอง"]
+            EXPAND["1. Task Expansion (1:N)<br/>Match s.key_type = g.key_type"]
+            STG_TASK["📋 staging_deletion_task<br/>(Task Queue per Table Group)"]
+            VALIDATE["2. Validate against Target Table<br/>• NOT_FOUND (Missing)<br/>• VALIDATED (Found)"]
+            COUNT["3. Bottom-Up Estimated COUNT<br/>(Unified WHERE Clause)"]
+            SUMMARY["📊 deletion_dry_run_summary<br/>(สรุปยอดประเมินรออนุมัติ)"]
         end
 
-        subgraph PHASE2["Phase 2: Chunked Batch Deletion"]
-            FETCH["Fetch Chunk<br/>(500 keys, FOR UPDATE SKIP LOCKED)"]
-            DELETE["Delete Bottom-Up<br/>Order 1 → 2 → 3<br/>(Grandchild → Child → Parent)"]
-            AUDIT["deletion_audit_log<br/>บันทึกผลจริงราย Chunk"]
-            COMMIT["COMMIT + pg_sleep"]
+        subgraph PHASE2["Phase 2: Chunked Real Deletion"]
+            FETCH["1. Fetch Chunk<br/>(FOR UPDATE SKIP LOCKED LIMIT 500)"]
+            DELETE["2. Delete Bottom-Up<br/>Order 1 → 2 → 3<br/>(Grandchild → Child → Root Target)"]
+            AUDIT["3. deletion_audit_log<br/>บันทึกยอดลบจริงราย Chunk"]
+            COMMIT["4. Update task -> COMPLETED<br/>COMMIT + pg_sleep (Throttle)"]
         end
     end
 
-    subgraph OUTPUT["📊 Output"]
-        REPORT["Dry Run Report<br/>(ส่ง Ops/Manager อนุมัติ)"]
-        AUDITREPORT["Audit Trail Report<br/>(หลักฐานตรวจสอบ)"]
+    subgraph OUTPUT["📊 Operations & Compliance"]
+        REPORT["Dry Run Sign-off Report<br/>(ส่ง Business/Ops อนุมัติ)"]
+        AUDITREPORT["Compliance Audit Trail<br/>(หลักฐานการทำลายข้อมูล)"]
     end
 
     EXCEL --> INGEST
     CSV --> INGEST
-    INGEST --> STAGING
+    INGEST --> STG_ITEM
 
-    STAGING --> VALIDATE
+    STG_ITEM --> EXPAND
+    EXPAND --> STG_TASK
+    STG_TASK --> VALIDATE
     VALIDATE --> COUNT
     COUNT --> SUMMARY
     SUMMARY --> REPORT
 
-    STAGING --> FETCH
+    STG_TASK --> FETCH
     FETCH --> DELETE
     DELETE --> AUDIT
     AUDIT --> COMMIT
     COMMIT -->|"ยังมี VALIDATED เหลือ"| FETCH
-    COMMIT -->|"หมดแล้ว"| AUDITREPORT
+    COMMIT -->|"ประมวลผลครบถ้วน"| AUDITREPORT
+```
+
+---
+
+## 2.1 🔄 End-to-End Sequence Diagram
+
+ไดอะแกรมแสดงลำดับขั้นตอนการโต้ตอบระหว่าง Actor, Script, Stored Procedures และ Tables ตลอดทั้งกระบวนการ:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Ops as Operations / DBA
+    actor Approver as Business Approver
+    participant File as Excel / CSV File
+    participant CLI as Python ingest.py
+    participant DBItem as staging_deletion_item
+    participant DBTask as staging_deletion_task
+    participant DBTarget as Target Tables (deletion_rule)
+    participant DBSummary as deletion_dry_run_summary
+    participant DBAudit as deletion_audit_log
+
+    Note over Ops,File: 1. Ingestion Phase
+    Ops->>File: เตรียมไฟล์ระบุ key_type และ key_no
+    Ops->>CLI: python ingest.py --file keys.xlsx --batch BATCH-2025
+    CLI->>File: อ่านและกรองข้อมูล (Deduplicate)
+    CLI->>DBItem: Bulk INSERT INTO staging_deletion_item (batch_id, key_type, key_no)
+    DBItem-->>CLI: สำเร็จ (บันทึก Master Keys)
+    CLI-->>Ops: พิมพ์สรุปจำนวน Key ที่ Ingest สำเร็จ
+
+    Note over Ops,DBSummary: 2. Phase 1: Analytical Dry Run
+    Ops->>DBTask: CALL run_data_deletion_dry_run('BATCH-2025')
+    Note right of DBTask: Step 2.1: Task Expansion (1:N)<br/>จับคู่ s.key_type = g.key_type
+    DBTask->>DBTask: INSERT INTO staging_deletion_task (status='PENDING')
+    
+    Note right of DBTask: Step 2.2: Target Table Direct Validation<br/>(ตรวจสอบกับ Root Target Table สูงสุดของกลุ่ม)
+    DBTask->>DBTarget: ตรวจสอบ NOT EXISTS (SELECT 1 FROM target_table WHERE ...)
+    DBTask->>DBTask: ปรับ status เป็น 'NOT_FOUND' (หากไม่พบแถวในตาราง)
+    DBTask->>DBTask: ปรับ status เป็น 'VALIDATED' (หากพบข้อมูล)
+
+    Note right of DBTask: Step 2.3: Bottom-Up Count Estimation
+    loop วนตาม deletion_rule ของแต่ละกลุ่ม
+        DBTask->>DBTarget: SELECT COUNT(*) FROM target WHERE ... = ANY($1)
+        DBTarget-->>DBSummary: INSERT INTO deletion_dry_run_summary
+    end
+    DBTask-->>Ops: พิมพ์สรุปผลผ่าน RAISE NOTICE
+
+    Note over Ops,Approver: 3. Business Sign-off
+    Ops->>DBSummary: Query สรุปยอดประเมินจาก deletion_dry_run_summary
+    Ops->>Approver: ส่งรายงานขอยืนยันการลบ
+    Approver-->>Ops: ตรวจสอบและลงนามอนุมัติ (Sign-off)
+
+    Note over Ops,DBAudit: 4. Phase 2: Chunked Real Deletion
+    Ops->>DBTask: CALL run_data_deletion('BATCH-2025')
+    loop ประมวลผลทีละ Chunk (FOR UPDATE SKIP LOCKED LIMIT chunk_size)
+        DBTask->>DBTask: ดึง Keys ที่ status = 'VALIDATED'
+        loop ลบตามลำดับ Bottom-Up (Order 1 -> N)
+            DBTask->>DBTarget: DELETE FROM target_table WHERE ... = ANY($chunk)
+            DBTarget-->>DBAudit: INSERT INTO deletion_audit_log (deleted_row_count)
+        end
+        DBTask->>DBTask: UPDATE status = 'COMPLETED', processed_at = NOW()
+        DBTask->>DBTask: COMMIT Micro-Transaction
+        DBTask->>DBTask: PERFORM pg_sleep(throttle_sec)
+    end
+    DBTask-->>Ops: Deletion Completed for all groups!
+
+    Note over Ops,DBTarget: 5. Post-Maintenance Phase
+    Ops->>DBTarget: VACUUM ANALYZE target_tables;
+    Ops->>DBAudit: Export หลักฐาน Audit Trail เพื่อ Compliance
 ```
 
 ---
@@ -75,12 +148,16 @@ flowchart TB
 ```mermaid
 erDiagram
     deletion_group ||--o{ deletion_rule : "has rules"
-    deletion_group ||--o{ staging_deletion_item : "receives keys"
+    deletion_group ||--o{ staging_deletion_task : "governs execution"
+    staging_deletion_item ||--|{ staging_deletion_task : "expands to (1:N)"
+    staging_deletion_task ||--o{ deletion_audit_log : "logs audit"
+
     deletion_group {
-        varchar group_code PK "รหัสกลุ่มงาน เช่น ORDERS"
-        text description "คำอธิบาย"
+        varchar group_code PK "รหัสกลุ่มตาราง เช่น ORDERS, INVOICES"
+        varchar key_type "ประเภท Key ที่รองรับ เช่น ORDER_NO, CUSTOMER_ID"
+        text description "คำอธิบายกลุ่มงาน"
         int chunk_size "จำนวน key ต่อ chunk (default 500)"
-        numeric throttle_sec "หน่วงเวลาระหว่าง chunk (default 0.05)"
+        numeric throttle_sec "เวลาหน่วงระหว่าง chunk (default 0.05)"
         boolean is_active "เปิด/ปิดกลุ่มงาน"
         timestamptz created_at "วันที่สร้าง"
     }
@@ -88,20 +165,29 @@ erDiagram
     deletion_rule {
         serial id PK "Auto-increment ID"
         varchar group_code FK "อ้างอิง deletion_group"
-        varchar target_table "ชื่อตารางเป้าหมาย"
-        int execution_order "ลำดับการลบ (1=ลูกสุด N=parent)"
-        text where_clause_template "WHERE clause ที่ใช้ร่วมกันทั้ง COUNT และ DELETE"
+        varchar target_table "ชื่อตารางเป้าหมายที่ต้องลบ"
+        int execution_order "ลำดับการลบ (1=ลูกสุด N=Parent)"
+        text where_clause_template "WHERE clause ใช้ร่วมกันทั้ง COUNT และ DELETE"
     }
 
     staging_deletion_item {
         bigserial id PK "Auto-increment ID"
         varchar batch_id "รหัส Batch เช่น BATCH-2025"
-        varchar group_code FK "อ้างอิง deletion_group"
-        varchar key_no "Key จากไฟล์ Excel/CSV"
-        varchar status "สถานะ: PENDING VALIDATED NOT_FOUND COMPLETED PARTIAL_COMPLETED FAILED"
+        varchar key_type "ประเภท Key จากไฟล์ เช่น ORDER_NO, CUSTOMER_ID"
+        varchar key_no "ค่าของ Key"
+        timestamptz created_at "เวลานำเข้า"
+    }
+
+    staging_deletion_task {
+        bigserial id PK "Auto-increment ID"
+        varchar batch_id "รหัส Batch"
+        bigint item_id FK "อ้างอิง staging_deletion_item.id (CASCADE)"
+        varchar group_code FK "อ้างอิง deletion_group.group_code (CASCADE)"
+        varchar key_no "ค่าของ Key (Denormalized เพื่อ Index และ Chunking เร็ว)"
+        varchar status "สถานะ: PENDING, NOT_FOUND, VALIDATED, COMPLETED, FAILED"
         text error_message "ข้อผิดพลาด (ถ้ามี)"
-        timestamptz processed_at "เวลาที่ประมวลผลเสร็จ"
-        timestamptz created_at "เวลาที่นำเข้า"
+        timestamptz processed_at "เวลาประมวลผลเสร็จ"
+        timestamptz created_at "เวลาสร้าง Task"
     }
 
     deletion_dry_run_summary {
@@ -122,108 +208,43 @@ erDiagram
         bigint deleted_row_count "จำนวนแถวที่ลบจริง"
         timestamptz executed_at "เวลาที่ลบ"
     }
-
-    staging_deletion_item }o--|| deletion_dry_run_summary : "generates"
-    staging_deletion_item }o--|| deletion_audit_log : "produces"
-```
-
-### 3.2 Mock Tables (ตัวอย่างตารางเป้าหมาย 3 ระดับ)
-
-```mermaid
-erDiagram
-    orders ||--o{ order_items : "has items"
-    order_items ||--o{ order_item_logs : "has logs"
-
-    orders {
-        varchar order_no PK "เลขที่คำสั่งซื้อ เช่น ORD-00001"
-        date order_date "วันที่สั่งซื้อ"
-        varchar customer_name "ชื่อลูกค้า"
-        timestamptz created_at "วันที่สร้าง"
-    }
-
-    order_items {
-        bigserial id PK "Auto-increment ID"
-        varchar order_no FK "อ้างอิง orders.order_no"
-        varchar item_name "ชื่อสินค้า"
-        int qty "จำนวน"
-        numeric amount "ราคา"
-        timestamptz created_at "วันที่สร้าง"
-    }
-
-    order_item_logs {
-        bigserial id PK "Auto-increment ID"
-        bigint item_id FK "อ้างอิง order_items.id"
-        text log_text "ข้อความ log"
-        timestamptz created_at "วันที่สร้าง"
-    }
-```
-
-### 3.3 ความสัมพันธ์ระหว่าง Framework กับ Target Tables
-
-```mermaid
-flowchart LR
-    subgraph FRAMEWORK["Framework Tables"]
-        DG["deletion_group<br/>group_code: ORDERS"]
-        DR1["deletion_rule<br/>order 1: order_item_logs"]
-        DR2["deletion_rule<br/>order 2: order_items"]
-        DR3["deletion_rule<br/>order 3: orders"]
-    end
-
-    subgraph TARGET["Target Tables (ข้อมูลจริง)"]
-        OIL["order_item_logs<br/>(Grandchild)"]
-        OI["order_items<br/>(Child)"]
-        O["orders<br/>(Parent)"]
-    end
-
-    DG --> DR1
-    DG --> DR2
-    DG --> DR3
-
-    DR1 -.->|"DELETE FROM"| OIL
-    DR2 -.->|"DELETE FROM"| OI
-    DR3 -.->|"DELETE FROM"| O
-
-    OIL -->|"FK: item_id"| OI
-    OI -->|"FK: order_no"| O
-
-    style OIL fill:#ff6b6b,color:#fff
-    style OI fill:#ffa94d,color:#fff
-    style O fill:#51cf66,color:#fff
 ```
 
 ---
 
-## 4. Staging Item State Machine
+## 4. Task State Machine (`staging_deletion_task`)
+
+การติดตามสถานะถูกบริหารจัดการในระดับ `staging_deletion_task` เพื่อให้แยกความคืบหน้ารายกลุ่มตารางได้อย่างอิสระ:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING: Ingest จาก Excel/CSV
+    [*] --> PENDING: Task Expansion จาก staging_deletion_item
 
-    PENDING --> NOT_FOUND: Key ไม่พบในตาราง Parent
-    PENDING --> VALIDATED: ผ่านการตรวจสอบ
+    PENDING --> NOT_FOUND: ตรวจไม่พบ Key ใน Target Table ของกลุ่ม
+    PENDING --> VALIDATED: ตรวจพบ Key ใน Target Table ของกลุ่ม
 
-    VALIDATED --> COMPLETED: ลบสำเร็จครบทุกระดับ
-    VALIDATED --> PARTIAL_COMPLETED: ลบสำเร็จบางระดับ (Granular)
-    VALIDATED --> FAILED: เกิดข้อผิดพลาดขณะลบ
+    VALIDATED --> COMPLETED: ลบครบทุกระดับ (Order 1 -> N)
+    VALIDATED --> PARTIAL_COMPLETED: ลบเฉพาะบางระดับ (Granular Mode)
+    VALIDATED --> FAILED: เกิด Error ขณะประมวลผล Chunk
 
-    NOT_FOUND --> [*]
-    COMPLETED --> [*]
-    PARTIAL_COMPLETED --> [*]
-    FAILED --> [*]
+    NOT_FOUND --> [*]: ข้ามการลบจริง
+    COMPLETED --> [*]: ลบสำเร็จสมบูรณ์
+    PARTIAL_COMPLETED --> [*]: ลบสำเร็จระดับล่าง
+    FAILED --> [*]: หยุดรอ DBA เข้าตรวจสอบ
 
     note right of PENDING
-        สถานะเริ่มต้นหลัง ingest.py
-        นำเข้าข้อมูลจากไฟล์
+        สร้างขึ้นเมื่อรัน Dry Run
+        ตามคู่ key_type = group_code
     end note
 
     note right of VALIDATED
-        ผ่าน Dry Run แล้ว
-        พร้อมสำหรับ Phase 2
+        พร้อมส่งต่อไปรันใน Phase 2
+        (Real Deletion)
     end note
 
-    note right of PARTIAL_COMPLETED
-        ใช้เมื่อรัน Granular Mode
-        เช่น ลบเฉพาะ Grandchild
+    note right of COMPLETED
+        บันทึก Audit Log ราย Chunk ครบ
+        และประทับเวลา processed_at
     end note
 ```
 
@@ -231,18 +252,23 @@ stateDiagram-v2
 
 ## 5. Database Schema Reference
 
-### 5.1 `deletion_group` — กลุ่มงานลบข้อมูล
+### 5.1 `deletion_group` — กลุ่มงานลบชุดตาราง
 
 | Column | Type | Nullable | Default | Description |
 |---|---|---|---|---|
-| `group_code` | `VARCHAR(50)` | NOT NULL | — | **PK.** รหัสกลุ่ม เช่น `ORDERS`, `TRANSACTIONS` |
+| `group_code` | `VARCHAR(50)` | NOT NULL | — | **PK.** รหัสกลุ่มตาราง เช่น `ORDERS`, `INVOICES` |
+| `key_type` | `VARCHAR(50)` | NOT NULL | — | **ประเภท Key ที่กลุ่มนี้รับ** เช่น `ORDER_NO`, `CUSTOMER_ID` |
 | `description` | `TEXT` | NULL | — | คำอธิบายกลุ่มงาน |
-| `chunk_size` | `INT` | NOT NULL | `500` | จำนวน key ที่ประมวลผลต่อ 1 chunk (1 transaction) |
-| `throttle_sec` | `NUMERIC(4,2)` | NOT NULL | `0.05` | เวลาหน่วง (วินาที) ระหว่าง chunk เพื่อคืน I/O |
-| `is_active` | `BOOLEAN` | NOT NULL | `TRUE` | เปิด/ปิดกลุ่มงาน |
+| `chunk_size` | `INT` | NOT NULL | `500` | จำนวน key ต่อ 1 chunk (1 transaction) |
+| `throttle_sec` | `NUMERIC(4,2)` | NOT NULL | `0.05` | เวลาหน่วง (วินาที) ระหว่าง chunk |
+| `is_active` | `BOOLEAN` | NOT NULL | `TRUE` | เปิด/ปิดการใช้งานกลุ่มนี้ |
 | `created_at` | `TIMESTAMPTZ` | NOT NULL | `CURRENT_TIMESTAMP` | เวลาสร้าง |
 
-### 5.2 `deletion_rule` — กฎการลบ (Unified WHERE Clause)
+**Index:** `idx_deletion_group_key_type ON (key_type, is_active)` — สำหรับ Task Expansion
+
+---
+
+### 5.2 `deletion_rule` — กฎการลบ Bottom-Up (Unified WHERE Clause)
 
 | Column | Type | Nullable | Default | Description |
 |---|---|---|---|---|
@@ -252,46 +278,71 @@ stateDiagram-v2
 | `execution_order` | `INT` | NOT NULL | — | ลำดับ Bottom-Up: **1 = ลูกสุด, N = Parent** |
 | `where_clause_template` | `TEXT` | NOT NULL | — | WHERE clause ที่ `$1` = Array ของ Parent Key |
 
-> **Unique Constraint:** `(group_code, execution_order)` — แต่ละกลุ่มมีลำดับการลบไม่ซ้ำกัน  
-> **หลักการ Unified WHERE:** ฟิลด์ `where_clause_template` ถูกใช้ทั้ง Dry Run (COUNT) และ Real Delete (DELETE) เพื่อรับประกันว่าผลลัพธ์ตรงกัน 100%
+> **Unique Constraint:** `(group_code, execution_order)`  
+> **หลักการ Unified WHERE:** ใช้ WHERE clause เดียวกันทั้ง COUNT (Dry Run) และ DELETE (Real Delete) เพื่อรับประกันความถูกต้อง 100%
 
-### 5.3 `staging_deletion_item` — รายการ Key จากไฟล์
+---
+
+### 5.3 `staging_deletion_item` — รายการ Master Key จากไฟล์
 
 | Column | Type | Nullable | Default | Description |
 |---|---|---|---|---|
 | `id` | `BIGSERIAL` | NOT NULL | Auto | **PK** |
 | `batch_id` | `VARCHAR(50)` | NOT NULL | — | รหัส Batch เช่น `BATCH-2025` |
-| `group_code` | `VARCHAR(50)` | NOT NULL | — | **FK** → `deletion_group.group_code` |
-| `key_no` | `VARCHAR(100)` | NOT NULL | — | Key ที่ต้องการลบ (จากไฟล์) |
-| `status` | `VARCHAR(30)` | NOT NULL | `PENDING` | สถานะปัจจุบัน (ดู State Machine) |
-| `error_message` | `TEXT` | NULL | — | ข้อผิดพลาด (เมื่อ status = FAILED) |
-| `processed_at` | `TIMESTAMPTZ` | NULL | — | เวลาที่ประมวลผลเสร็จ |
+| `key_type` | `VARCHAR(50)` | NOT NULL | — | ประเภท Key เช่น `ORDER_NO`, `CUSTOMER_ID` |
+| `key_no` | `VARCHAR(100)` | NOT NULL | — | ค่าของ Key จากไฟล์ |
 | `created_at` | `TIMESTAMPTZ` | NOT NULL | `CURRENT_TIMESTAMP` | เวลานำเข้า |
 
-**Index:** `idx_staging_fetch ON (group_code, batch_id, status, id)` — เพื่อประสิทธิภาพในการดึง Chunk
+**Constraint:** `UNIQUE (batch_id, key_type, key_no)` — ป้องกันการนำเข้า Key ซ้ำใน Batch เดียวกัน  
+**Index:** `idx_staging_item_lookup ON (batch_id, key_type)`
 
-### 5.4 `deletion_dry_run_summary` — สรุปผล Dry Run
+---
+
+### 5.4 `staging_deletion_task` — คิวงานย่อยรายกลุ่มตาราง (Execution Tasks)
+
+| Column | Type | Nullable | Default | Description |
+|---|---|---|---|---|
+| `id` | `BIGSERIAL` | NOT NULL | Auto | **PK** |
+| `batch_id` | `VARCHAR(50)` | NOT NULL | — | รหัส Batch |
+| `item_id` | `BIGINT` | NOT NULL | — | **FK** → `staging_deletion_item.id` (`ON DELETE CASCADE`) |
+| `group_code` | `VARCHAR(50)` | NOT NULL | — | **FK** → `deletion_group.group_code` (`ON DELETE CASCADE`) |
+| `key_no` | `VARCHAR(100)` | NOT NULL | — | ค่าของ Key (Denormalized สำหรับ Query เร็ว) |
+| `status` | `VARCHAR(30)` | NOT NULL | `'PENDING'` | สถานะ: `PENDING`, `NOT_FOUND`, `VALIDATED`, `COMPLETED`, `FAILED` |
+| `error_message` | `TEXT` | NULL | — | ข้อผิดพลาดกรณี `FAILED` |
+| `processed_at` | `TIMESTAMPTZ` | NULL | — | เวลาที่ประมวลผลเสร็จ |
+| `created_at` | `TIMESTAMPTZ` | NOT NULL | `CURRENT_TIMESTAMP` | เวลาสร้าง Task |
+
+**Constraint:** `UNIQUE (batch_id, group_code, key_no)`  
+**Indexes:**
+- `idx_staging_task_fetch ON (group_code, batch_id, status, id)` — ดึง Chunk ด้วย `FOR UPDATE SKIP LOCKED`
+- `idx_staging_task_lookup ON (batch_id, group_code, key_no)` — อัปเดตสถานะราย Chunk ทันที
+
+---
+
+### 5.5 `deletion_dry_run_summary` — สรุปผล Dry Run
 
 | Column | Type | Description |
 |---|---|---|
 | `id` | `BIGSERIAL` | **PK** |
 | `batch_id` | `VARCHAR(50)` | รหัส Batch |
-| `group_code` | `VARCHAR(50)` | รหัสกลุ่ม |
+| `group_code` | `VARCHAR(50)` | รหัสกลุ่มตาราง |
 | `target_table` | `VARCHAR(100)` | ตารางเป้าหมาย |
-| `execution_order` | `INT` | ลำดับ |
+| `execution_order` | `INT` | ลำดับการลบ |
 | `estimated_rows_to_delete` | `BIGINT` | จำนวนแถวที่คาดว่าจะถูกลบ |
 | `executed_at` | `TIMESTAMPTZ` | เวลาที่จำลอง |
 
-### 5.5 `deletion_audit_log` — บันทึกผลการลบจริง
+---
+
+### 5.6 `deletion_audit_log` — บันทึกผลการลบจริง
 
 | Column | Type | Description |
 |---|---|---|
 | `id` | `BIGSERIAL` | **PK** |
 | `batch_id` | `VARCHAR(50)` | รหัส Batch |
-| `group_code` | `VARCHAR(50)` | รหัสกลุ่ม |
-| `target_table` | `VARCHAR(100)` | ตารางที่ลบ |
+| `group_code` | `VARCHAR(50)` | รหัสกลุ่มตาราง |
+| `target_table` | `VARCHAR(100)` | ตารางที่ถูกลบจริง |
 | `deleted_row_count` | `BIGINT` | จำนวนแถวที่ลบจริงใน Chunk นี้ |
-| `executed_at` | `TIMESTAMPTZ` | เวลาที่ลบ |
+| `executed_at` | `TIMESTAMPTZ` | เวลาที่ลบสำเร็จ |
 
 ---
 
@@ -299,172 +350,91 @@ stateDiagram-v2
 
 ### 6.1 `run_data_deletion_dry_run` (Phase 1)
 
-**วัตถุประสงค์:** จำลองการลบ (Count Only) โดยไม่ลบข้อมูลจริง **รองรับการรันทุกกลุ่มงาน (ALL groups) ในคำสั่งเดียว**
+**วัตถุประสงค์:** ทำ Task Expansion (1:N), ตรวจสอบความถูกต้องกับตารางเป้าหมายของกลุ่มโดยตรง (Root Target Table สูงสุดจาก `deletion_rule`) และนับจำนวนแถวที่จะถูกลบจริงตามกฎ Bottom-Up
 
 ```sql
 CALL run_data_deletion_dry_run(
-    p_batch_id       VARCHAR,              -- รหัส Batch เช่น 'BATCH-2025'
-    p_group_code     VARCHAR DEFAULT NULL,  -- NULL = รันทุกกลุ่มงานใน Batch นี้อัตโนมัติ!
-    p_parent_table   VARCHAR DEFAULT NULL,  -- Optional override (ปกติอ่านจาก deletion_group อัตโนมัติ)
-    p_parent_key_col VARCHAR DEFAULT NULL   -- Optional override
+    p_batch_id       VARCHAR,              -- รหัส Batch (เช่น 'BATCH-2025')
+    p_key_type       VARCHAR DEFAULT NULL,  -- NULL = รันทุก Key Type ใน Batch
+    p_group_code     VARCHAR DEFAULT NULL   -- NULL = รันทุกกลุ่มตารางที่เกี่ยวข้อง
 );
 ```
 
-**รูปแบบการเรียกใช้งาน:**
-- **รันทุกกลุ่มงานในคำสั่งเดียว (Single-Command All Groups):**
-  ```sql
-  CALL run_data_deletion_dry_run('BATCH-2025');
-  ```
-- **รันเฉพาะกลุ่มที่ต้องการ:**
-  ```sql
-  CALL run_data_deletion_dry_run('BATCH-2025', 'ORDERS');
-  ```
+**ตัวอย่างการเรียกใช้งาน:**
+```sql
+-- รันจำลองทุก Key Type และทุกกลุ่มตารางในคำสั่งเดียว (แนะนำ):
+CALL run_data_deletion_dry_run('BATCH-2025');
 
-**ขั้นตอนการทำงาน:**
-1. ตรวจหาทุก `group_code` ที่มีรายการอยู่ใน Batch นี้ (หากไม่ระบุ `p_group_code`)
-2. วน Loop ทีละกลุ่มงาน โดยอ่าน `parent_table` และ `parent_key_col` จาก `deletion_group` อัตโนมัติ
-3. ตรวจสอบ Key ที่ไม่มีอยู่ในตาราง Parent → อัปเดตเป็น `NOT_FOUND`
-4. Key ที่เหลือทั้งหมด → อัปเดตเป็น `VALIDATED`
-5. วนนับแถวที่จะโดนกระทบในแต่ละตารางตาม `deletion_rule` ของกลุ่มนั้น
-6. บันทึกผลลงตาราง `deletion_dry_run_summary`
-7. พิมพ์สรุปผลทุกกลุ่มงานผ่าน `RAISE NOTICE`
+-- รันเฉพาะ Key Type ที่ต้องการ:
+CALL run_data_deletion_dry_run('BATCH-2025', 'ORDER_NO');
+
+-- รันเฉพาะกลุ่มตารางเจาะจง:
+CALL run_data_deletion_dry_run('BATCH-2025', NULL, 'ORDERS');
+```
 
 ---
 
 ### 6.2 `run_data_deletion` (Phase 2)
 
-**วัตถุประสงค์:** ลบข้อมูลจริงแบบ Chunk-by-Chunk ตามลำดับ Bottom-Up **รองรับการลบทุกกลุ่มงาน (ALL groups) ในคำสั่งเดียว**
+**วัตถุประสงค์:** ลบข้อมูลจริงแบบ Micro-Transaction ทีละ Chunk ตามลำดับ Bottom-Up จากตาราง `staging_deletion_task`
 
 ```sql
 CALL run_data_deletion(
     p_batch_id     VARCHAR,              -- รหัส Batch
-    p_group_code   VARCHAR DEFAULT NULL,  -- NULL = ลบทุกกลุ่มงานใน Batch นี้อัตโนมัติ!
-    p_up_to_order  INT     DEFAULT NULL   -- ลบถึงระดับไหน (NULL = ทุกระดับ)
+    p_group_code   VARCHAR DEFAULT NULL,  -- NULL = ลบทุกกลุ่มตารางใน Batch นี้อัตโนมัติ
+    p_up_to_order  INT     DEFAULT NULL   -- ลบถึงระดับใด (NULL = ทุกระดับ)
 );
 ```
 
-**รูปแบบการเรียกใช้งาน:**
-- **สั่งลบทุกกลุ่มงานในคำสั่งเดียว (Single-Command All Groups):**
-  ```sql
-  CALL run_data_deletion('BATCH-2025');
-  ```
-- **สั่งลบเฉพาะกลุ่มที่ต้องการ:**
-  ```sql
-  CALL run_data_deletion('BATCH-2025', 'ORDERS');
-  ```
-- **สั่งลบเฉพาะระดับล่าง (Granular Mode):**
-  ```sql
-  CALL run_data_deletion('BATCH-2025', 'ORDERS', 1); -- ลบเฉพาะ Grandchild
-  ```
-
-**Parameter `p_up_to_order`:**
-
-| ค่า | ลำดับที่ลบ | ตัวอย่าง (ORDERS group) |
-|---|---|---|
-| `NULL` | ลบครบทุกระดับ | `order_item_logs` → `order_items` → `orders` |
-| `2` | ลบถึง Child | `order_item_logs` → `order_items` |
-| `1` | ลบเฉพาะ Grandchild | `order_item_logs` เท่านั้น |
-
-> ระบบ **ไม่อนุญาต** ให้ข้ามลำดับ — หากระบุ `p_up_to_order = 3` (Parent) ระบบจะลบ order 1 → 2 → 3 ตามลำดับเสมอ ป้องกัน FK Violation
-
----
-
-## 7. Configuration Manual (คู่มือการตั้งค่า)
-
-### 7.1 ขั้นตอนที่ 1: สร้าง Deletion Group
-
+**ตัวอย่างการเรียกใช้งาน:**
 ```sql
-INSERT INTO deletion_group (group_code, description, chunk_size, throttle_sec)
-VALUES ('ORDERS', 'Yearly order data deletion', 500, 0.05);
-```
+-- สั่งลบทุกกลุ่มตารางในคำสั่งเดียว (แนะนำ):
+CALL run_data_deletion('BATCH-2025');
 
-| Parameter | คำแนะนำ | เหตุผล |
-|---|---|---|
-| `chunk_size` = 200-500 | ข้อมูล **หลักหมื่น** keys | สมดุลระหว่างความเร็วและ Load |
-| `chunk_size` = 500-1000 | ข้อมูล **หลักแสน** keys | เพิ่ม throughput แต่ WAL/Dead Tuple สูงขึ้น |
-| `throttle_sec` = 0.05 | ระบบ **มี Read Replica** | ให้เวลา Replica ตามทัน |
-| `throttle_sec` = 0 | ระบบ **ไม่มี Replica** | ไม่ต้องหน่วง ลบเร็วสุด |
+-- สั่งลบเฉพาะกลุ่มตาราง ORDERS:
+CALL run_data_deletion('BATCH-2025', 'ORDERS');
 
-### 7.2 ขั้นตอนที่ 2: กำหนด Deletion Rules
-
-`execution_order` ต้องเรียงจาก **ลูกสุด (1) ไปหา Parent (N)** เสมอ  
-ใน `where_clause_template` ตัว `$1` คือ Array ของ Parent Key
-
-#### ตัวอย่าง A: ตารางที่ Child มี FK ตรงกับ Parent Key
-```sql
-INSERT INTO deletion_rule (group_code, target_table, execution_order, where_clause_template)
-VALUES
-    ('SIMPLE_ORDERS', 'order_items', 1, 'WHERE order_no = ANY($1)'),
-    ('SIMPLE_ORDERS', 'orders',      2, 'WHERE order_no = ANY($1)');
-```
-
-#### ตัวอย่าง B: ตารางที่ Grandchild ต้อง JOIN ผ่าน Child
-```sql
-INSERT INTO deletion_rule (group_code, target_table, execution_order, where_clause_template)
-VALUES
-    ('ORDERS', 'order_item_logs', 1,
-     'WHERE item_id IN (SELECT id FROM order_items WHERE order_no = ANY($1))'),
-    ('ORDERS', 'order_items', 2,
-     'WHERE order_no = ANY($1)'),
-    ('ORDERS', 'orders', 3,
-     'WHERE order_no = ANY($1)');
-```
-
-#### ตัวอย่าง C: ตารางที่มี 4 ระดับ
-```sql
-INSERT INTO deletion_rule (group_code, target_table, execution_order, where_clause_template)
-VALUES
-    ('CUSTOMERS', 'payments', 1,
-     'WHERE invoice_id IN (SELECT invoice_id FROM invoices WHERE contract_id IN (SELECT contract_id FROM contracts WHERE customer_id = ANY($1)))'),
-    ('CUSTOMERS', 'invoices', 2,
-     'WHERE contract_id IN (SELECT contract_id FROM contracts WHERE customer_id = ANY($1))'),
-    ('CUSTOMERS', 'contracts', 3,
-     'WHERE customer_id = ANY($1)'),
-    ('CUSTOMERS', 'customers', 4,
-     'WHERE customer_id = ANY($1)');
+-- สั่งลบเฉพาะระดับล่าง (Granular Mode):
+CALL run_data_deletion('BATCH-2025', 'ORDERS', 1); -- ลบเฉพาะ Grandchild (order_item_logs)
+CALL run_data_deletion('BATCH-2025', 'ORDERS', 2); -- ลบถึง Child (order_items)
 ```
 
 ---
 
-## 8. Operational Workflow
+## 7. Python Ingestion CLI (`ingest.py`)
 
-```mermaid
-flowchart TD
-    S1["Step 1: เตรียมไฟล์ Excel/CSV"]
-    S2["Step 2: Ingest เข้า Staging"]
-    S3["Step 3: Dry Run (จำลอง)"]
-    S4["Step 4: ตรวจสอบรายงาน"]
-    S5{"ผลลัพธ์ถูกต้อง?"}
-    S6["Step 5: ขออนุมัติ Manager/Business"]
-    S7{"อนุมัติ?"}
-    S8["Step 6: สั่งลบจริง"]
-    S9["Step 7: ตรวจสอบ Audit Log"]
-    S10["Step 8: Post-Maintenance (VACUUM ANALYZE)"]
-    S11["Step 9: Export หลักฐาน Compliance"]
+รองรับทั้งไฟล์ Excel (`.xlsx`) และ CSV (`.csv`) พร้อมระบบตรวจจับคอลัมน์อัจฉริยะ:
 
-    S1 --> S2 --> S3 --> S4 --> S5
-    S5 -->|"ไม่ถูกต้อง"| S1
-    S5 -->|"ถูกต้อง"| S6 --> S7
-    S7 -->|"ไม่อนุมัติ"| S1
-    S7 -->|"อนุมัติ"| S8 --> S9 --> S10 --> S11
+```bash
+# 1. ไฟล์ที่มีคอลัมน์ key_type และ key_no อยู่แล้ว (Auto-detect):
+python scripts/ingest.py --file bulk_keys.xlsx --batch BATCH-2025
+
+# 2. ไฟล์ที่มีคอลัมน์เดียว (ระบุ key_type ผ่าน CLI):
+python scripts/ingest.py --file orders_2024.csv --batch BATCH-2025 --key-type ORDER_NO
+
+# 3. ระบุ Custom Database Connection URL:
+python scripts/ingest.py --file bulk_keys.xlsx --batch BATCH-2025 --db-url postgresql://user:pass@host:5432/db
 ```
 
 ---
 
-## 9. Example Test Results
+## 8. Verification & Reporting Architecture (Target Table Level)
 
-### ข้อมูลตั้งต้น
-- `orders`: 10,000 แถว
-- `order_items`: 30,000 แถว (3 items/order)
-- `order_item_logs`: 60,000 แถว (2 logs/item)
-- `sample_keys.csv`: 2,000 keys
+ระบบได้แยกชุดคำสั่ง SQL สำหรับ Generate Report และ Verify ผลลัพธ์ออกเป็น 2 สคริปต์หลัก โดยแสดงผลลัพธ์ในระดับ **Target Table Level** โดยตรง เพื่อให้สอดคล้องกับโครงสร้างฐานข้อมูลจริงและการตรวจสอบของ Auditor:
 
-### ผลลัพธ์จริงหลังทดสอบครบถ้วน
-| Table | Before | After Granular (Order 1) | After Full Delete | Deleted Total |
-|---|---|---|---|---|
-| `orders` | 10,000 | 10,000 | **8,000** | 2,000 |
-| `order_items` | 30,000 | 30,000 | **24,000** | 6,000 |
-| `order_item_logs` | 60,000 | **48,000** | **48,000** | 12,000 |
+### 8.1 Phase 1 Verification: `sql/05_report_verify_dry_run.sql`
+ใช้ตรวจสอบความถูกต้องหลังรัน Analytical Dry Run เพื่อนำเสนอ Business Approver:
+1. **Report 1: Ingestion & Target Table Mapping Verification** — ตรวจสอบจำนวน Master Keys และการกระจาย Tasks รายตารางเป้าหมาย
+2. **Report 2: Task Validation Summary & Match Rate** — สรุปอัตรา Match Rate (%) และสัดส่วน VALIDATED vs NOT_FOUND รายตาราง
+3. **Report 3: Exception List: Missing Keys (`NOT_FOUND`)** — ดึงรายชื่อคีย์ที่ไม่พบบนตารางหลัก (`root_target_table`) เพื่อส่งคืนฝ่ายธุรกิจ
+4. **Report 4: Bottom-Up Estimated Rows to Delete** — ยอดแถวจำลองที่จะถูกลบรายตารางตามลำดับ Bottom-Up
+5. **Report 5: Formal Executive Sign-off Summary** — รายงานสรุปภาพรวมรายตารางเป้าหมายสำหรับแนบเอกสารขออนุมัติ
 
-- **Granular mode**: ลบเฉพาะ `order_item_logs` (12,000 แถว) โดย `order_items` และ `orders` ไม่ถูกแตะ
-- **Full mode**: ลบ `order_items` (6,000 แถว) และ `orders` (2,000 แถว) ครบถ้วนโดยไม่เกิด Foreign Key Violation
+### 8.2 Phase 2 Verification: `sql/06_report_verify_real_deletion.sql`
+ใช้ตรวจสอบความสมบูรณ์หลังรัน Real Deletion เพื่อยืนยัน Zero-Defect และส่งต่อ Compliance Audit:
+1. **Report 1: Task Execution Progress & Completion Audit** — ตรวจสอบว่า Tasks รายตารางเป็น COMPLETED หรือ NOT_FOUND ครบ 100%
+2. **Report 2: 100% Reconciliation & Variance Report** — เปรียบเทียบ Dry Run Estimated vs Actual Deleted รายตาราง (`Variance = 0`)
+3. **Report 3: Zero-Leakage Residual Sanity Check** — ยืนยันว่าไม่มีคีย์ที่สั่งลบหลงเหลืออยู่ในตารางหลักแม้แต่เรคคอร์ดเดียว
+4. **Report 4: Deletion Throughput & Performance Summary** — สถิติ Chunks, เวลาที่ใช้ และอัตราความเร็ว (Rows/Sec) รายตาราง
+5. **Report 5: Compliance Certificate of Destruction / Audit Trail** — ใบรับรองหลักฐานการทำลายข้อมูลรายตารางเป้าหมายตามข้อกำหนด PDPA
+

@@ -1,7 +1,7 @@
 -- =============================================
 -- Stored Procedures: Dry Run & Real Deletion
--- Auto-loaded by Docker on first container start
--- Supports running a single group or ALL groups in one command
+-- Auto-loaded by Docker on first container start (2-Tier Item & Task Model)
+-- Checks NOT_FOUND directly against Group Target Table
 -- =============================================
 
 -- =============================================
@@ -10,71 +10,109 @@
 
 CREATE OR REPLACE PROCEDURE run_data_deletion_dry_run(
     p_batch_id       VARCHAR,
-    p_group_code     VARCHAR DEFAULT NULL,  -- NULL = run ALL groups in this batch
-    p_parent_table   VARCHAR DEFAULT NULL,  -- Optional override
-    p_parent_key_col VARCHAR DEFAULT NULL   -- Optional override
+    p_key_type       VARCHAR DEFAULT NULL,  -- NULL = run ALL key_types in this batch
+    p_group_code     VARCHAR DEFAULT NULL   -- NULL = run ALL matching table groups
 )
 LANGUAGE plpgsql
 AS $$
 DECLARE
     v_grp             RECORD;
     v_rule            RECORD;
+    v_top_rule        RECORD;
     v_estimated_count BIGINT;
     v_all_keys        VARCHAR[];
     v_sql             TEXT;
     v_not_found_count BIGINT;
     v_validated_count BIGINT;
-    v_parent_table    VARCHAR;
-    v_parent_key_col  VARCHAR;
+    v_tasks_created   BIGINT;
     v_groups_run      INT := 0;
 BEGIN
+    RAISE NOTICE '==================================================';
+    RAISE NOTICE '[DRY RUN] Starting for Batch: % | Filter KeyType: % | Filter Group: %',
+        p_batch_id, COALESCE(p_key_type, 'ALL'), COALESCE(p_group_code, 'ALL');
+    RAISE NOTICE '==================================================';
+
+    -- Step 1: Task Expansion (Expand raw staging items into group deletion tasks)
+    INSERT INTO staging_deletion_task (batch_id, item_id, group_code, key_no, status)
+    SELECT 
+        s.batch_id, 
+        s.id, 
+        g.group_code, 
+        s.key_no, 
+        'PENDING'
+    FROM staging_deletion_item s
+    JOIN deletion_group g ON g.key_type = s.key_type AND g.is_active = TRUE
+    WHERE s.batch_id = p_batch_id
+      AND (p_key_type IS NULL OR s.key_type = p_key_type)
+      AND (p_group_code IS NULL OR g.group_code = p_group_code)
+    ON CONFLICT (batch_id, group_code, key_no) DO NOTHING;
+    GET DIAGNOSTICS v_tasks_created = ROW_COUNT;
+    RAISE NOTICE '[DRY RUN] Task Expansion completed: % task(s) mapped/created', v_tasks_created;
+
+    -- Step 2: Iterate through all active groups that have tasks in this batch
     FOR v_grp IN (
-        SELECT DISTINCT g.group_code, g.parent_table, g.parent_key_col
-        FROM staging_deletion_item s
-        JOIN deletion_group g ON g.group_code = s.group_code
-        WHERE s.batch_id = p_batch_id
+        SELECT DISTINCT g.group_code, g.key_type
+        FROM staging_deletion_task t
+        JOIN deletion_group g ON g.group_code = t.group_code
+        WHERE t.batch_id = p_batch_id
           AND g.is_active = TRUE
           AND (p_group_code IS NULL OR g.group_code = p_group_code)
+          AND (p_key_type IS NULL OR g.key_type = p_key_type)
         ORDER BY g.group_code
     ) LOOP
         v_groups_run := v_groups_run + 1;
 
-        RAISE NOTICE '==================================================';
-        RAISE NOTICE '[DRY RUN] GROUP: % | Batch: %', v_grp.group_code, p_batch_id;
-        RAISE NOTICE '==================================================';
+        RAISE NOTICE '--------------------------------------------------';
+        RAISE NOTICE '[DRY RUN] Processing GROUP: % (KeyType: %) | Batch: %', 
+            v_grp.group_code, v_grp.key_type, p_batch_id;
+        RAISE NOTICE '--------------------------------------------------';
 
-        v_parent_table := COALESCE(p_parent_table, v_grp.parent_table);
-        v_parent_key_col := COALESCE(p_parent_key_col, v_grp.parent_key_col);
-
+        -- Clear previous dry run results for this batch and group
         DELETE FROM deletion_dry_run_summary 
         WHERE batch_id = p_batch_id AND group_code = v_grp.group_code;
 
-        IF v_parent_table IS NOT NULL AND v_parent_key_col IS NOT NULL THEN
-            v_sql := format('
-                UPDATE staging_deletion_item s
-                SET status = ''NOT_FOUND''
-                WHERE s.batch_id = %L AND s.group_code = %L AND s.status = ''PENDING''
-                  AND NOT EXISTS (SELECT 1 FROM %I p WHERE p.%I = s.key_no)',
-                p_batch_id, v_grp.group_code, v_parent_table, v_parent_key_col);
+        -- Step 3: Find top-level target table (highest execution_order) to check existence directly
+        SELECT target_table, where_clause_template
+        INTO v_top_rule
+        FROM deletion_rule
+        WHERE group_code = v_grp.group_code
+        ORDER BY execution_order DESC
+        LIMIT 1;
 
-            RAISE NOTICE '[DRY RUN][%] Checking Not Found against % (%)...',
-                v_grp.group_code, v_parent_table, v_parent_key_col;
+        -- Check NOT_FOUND directly against Target Table
+        IF v_top_rule.target_table IS NOT NULL AND v_top_rule.where_clause_template IS NOT NULL THEN
+            v_sql := format('
+                UPDATE staging_deletion_task t
+                SET status = ''NOT_FOUND''
+                WHERE t.batch_id = %L AND t.group_code = %L AND t.status = ''PENDING''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM %I %s
+                  )',
+                p_batch_id, v_grp.group_code, v_top_rule.target_table,
+                replace(v_top_rule.where_clause_template, '$1', 'ARRAY[t.key_no]'));
+
+            RAISE NOTICE '[DRY RUN][%] Checking NOT_FOUND directly against Target Table: %...',
+                v_grp.group_code, v_top_rule.target_table;
             EXECUTE v_sql;
             GET DIAGNOSTICS v_not_found_count = ROW_COUNT;
-            RAISE NOTICE '[DRY RUN][%] Not Found keys: %', v_grp.group_code, v_not_found_count;
+            RAISE NOTICE '[DRY RUN][%] Not Found keys (no rows in target table): %', 
+                v_grp.group_code, v_not_found_count;
         END IF;
 
-        UPDATE staging_deletion_item
+        -- All remaining PENDING -> VALIDATED
+        UPDATE staging_deletion_task
         SET status = 'VALIDATED'
         WHERE batch_id = p_batch_id AND group_code = v_grp.group_code AND status = 'PENDING';
         GET DIAGNOSTICS v_validated_count = ROW_COUNT;
         RAISE NOTICE '[DRY RUN][%] Validated keys: %', v_grp.group_code, v_validated_count;
 
+        -- Collect all validated keys for this group
         SELECT ARRAY(
-            SELECT key_no FROM staging_deletion_item
+            SELECT key_no FROM staging_deletion_task
             WHERE batch_id = p_batch_id AND group_code = v_grp.group_code AND status = 'VALIDATED'
         ) INTO v_all_keys;
 
+        -- Count estimated rows for each target table bottom-up
         FOR v_rule IN (
             SELECT target_table, execution_order, where_clause_template
             FROM deletion_rule
@@ -104,8 +142,8 @@ BEGIN
     END LOOP;
 
     IF v_groups_run = 0 THEN
-        RAISE NOTICE 'No active groups with items found for Batch "%" (Filter: %)',
-            p_batch_id, COALESCE(p_group_code, 'ALL');
+        RAISE NOTICE 'No matching active groups/tasks found for Batch "%" (KeyType: %, Group: %)',
+            p_batch_id, COALESCE(p_key_type, 'ALL'), COALESCE(p_group_code, 'ALL');
     ELSE
         RAISE NOTICE '=== Dry Run Complete for % group(s) in Batch % ===', v_groups_run, p_batch_id;
     END IF;
@@ -120,7 +158,7 @@ $$;
 CREATE OR REPLACE PROCEDURE run_data_deletion(
     p_batch_id     VARCHAR,
     p_group_code   VARCHAR DEFAULT NULL,  -- NULL = delete ALL groups in this batch
-    p_up_to_order  INT DEFAULT NULL       -- NULL = all levels; or up to specific order
+    p_up_to_order  INT     DEFAULT NULL   -- NULL = all levels; or up to specific order
 )
 LANGUAGE plpgsql
 AS $$
@@ -136,12 +174,13 @@ DECLARE
     v_sql           TEXT;
     v_groups_run    INT := 0;
 BEGIN
+    -- Iterate through all active groups with VALIDATED tasks in this batch
     FOR v_grp IN (
         SELECT DISTINCT g.group_code, g.chunk_size, g.throttle_sec
-        FROM staging_deletion_item s
-        JOIN deletion_group g ON g.group_code = s.group_code
-        WHERE s.batch_id = p_batch_id
-          AND s.status = 'VALIDATED'
+        FROM staging_deletion_task t
+        JOIN deletion_group g ON g.group_code = t.group_code
+        WHERE t.batch_id = p_batch_id
+          AND t.status = 'VALIDATED'
           AND g.is_active = TRUE
           AND (p_group_code IS NULL OR g.group_code = p_group_code)
         ORDER BY g.group_code
@@ -151,6 +190,7 @@ BEGIN
         v_throttle_sec := v_grp.throttle_sec;
         v_chunk_count := 0;
 
+        -- Determine deletion scope for this group
         IF p_up_to_order IS NULL THEN
             SELECT MAX(execution_order) INTO v_max_order
             FROM deletion_rule WHERE group_code = v_grp.group_code;
@@ -165,10 +205,12 @@ BEGIN
         RAISE NOTICE '  Run orders: 1 -> %', v_max_order;
         RAISE NOTICE '==================================================';
 
+        -- Chunk processing loop for this group
         LOOP
+            -- Fetch next chunk of VALIDATED keys from staging_deletion_task
             SELECT ARRAY(
                 SELECT key_no 
-                FROM staging_deletion_item
+                FROM staging_deletion_task
                 WHERE batch_id = p_batch_id 
                   AND group_code = v_grp.group_code 
                   AND status = 'VALIDATED'
@@ -177,6 +219,7 @@ BEGIN
                 FOR UPDATE SKIP LOCKED
             ) INTO v_chunk_keys;
 
+            -- No more keys -> exit chunk loop
             IF v_chunk_keys IS NULL OR array_length(v_chunk_keys, 1) IS NULL THEN
                 EXIT;
             END IF;
@@ -185,6 +228,7 @@ BEGIN
             RAISE NOTICE '--- [%] Chunk #% | Keys: % ---', 
                 v_grp.group_code, v_chunk_count, array_length(v_chunk_keys, 1);
 
+            -- Delete Bottom-Up (order 1 -> v_max_order)
             FOR v_rule IN (
                 SELECT target_table, execution_order, where_clause_template
                 FROM deletion_rule
@@ -210,18 +254,21 @@ BEGIN
                     v_deleted_count, v_rule.target_table;
             END LOOP;
 
+            -- Always update task status to prevent infinite loop
             IF v_max_order = (SELECT MAX(execution_order) FROM deletion_rule WHERE group_code = v_grp.group_code) THEN
-                UPDATE staging_deletion_item
+                UPDATE staging_deletion_task
                 SET status = 'COMPLETED', processed_at = CURRENT_TIMESTAMP
                 WHERE batch_id = p_batch_id AND group_code = v_grp.group_code AND key_no = ANY(v_chunk_keys);
             ELSE
-                UPDATE staging_deletion_item
+                UPDATE staging_deletion_task
                 SET status = 'PARTIAL_COMPLETED', processed_at = CURRENT_TIMESTAMP
                 WHERE batch_id = p_batch_id AND group_code = v_grp.group_code AND key_no = ANY(v_chunk_keys);
             END IF;
 
+            -- Micro-Transaction Commit
             COMMIT;
 
+            -- Throttle
             IF v_throttle_sec > 0 THEN
                 PERFORM pg_sleep(v_throttle_sec);
             END IF;
@@ -231,7 +278,7 @@ BEGIN
     END LOOP;
 
     IF v_groups_run = 0 THEN
-        RAISE NOTICE 'No VALIDATED items found for Batch "%" (Filter: %)',
+        RAISE NOTICE 'No VALIDATED tasks found for Batch "%" (Filter: %)',
             p_batch_id, COALESCE(p_group_code, 'ALL');
     ELSE
         RAISE NOTICE '==================================================';

@@ -93,6 +93,7 @@ def phase1_seed_source_data(cur, count: int = 1_000_000):
     log("Resetting tables and identity sequences...", "INFO")
     cur.execute("""
         TRUNCATE TABLE 
+            staging_deletion_task,
             staging_deletion_item, 
             deletion_dry_run_summary, 
             deletion_audit_log, 
@@ -104,10 +105,10 @@ def phase1_seed_source_data(cur, count: int = 1_000_000):
     
     # 2. Configure deletion group & rules if needed
     cur.execute("""
-        INSERT INTO deletion_group (group_code, description, chunk_size, throttle_sec, parent_table, parent_key_col)
-        VALUES ('ORDERS', 'Yearly order data deletion', 500, 0.05, 'orders', 'order_no')
+        INSERT INTO deletion_group (group_code, key_type, description, chunk_size, throttle_sec)
+        VALUES ('ORDERS', 'ORDER_NO', 'Yearly order data deletion', 500, 0.05)
         ON CONFLICT (group_code) DO UPDATE 
-        SET chunk_size = 500, throttle_sec = 0.05, parent_table = 'orders', parent_key_col = 'order_no', is_active = TRUE;
+        SET key_type = 'ORDER_NO', chunk_size = 500, throttle_sec = 0.05, is_active = TRUE;
     """)
     cur.execute("""
         INSERT INTO deletion_rule (group_code, target_table, execution_order, where_clause_template)
@@ -117,12 +118,6 @@ def phase1_seed_source_data(cur, count: int = 1_000_000):
             ('ORDERS', 'orders',          3, 'WHERE order_no = ANY($1)')
         ON CONFLICT (group_code, execution_order) DO UPDATE
         SET target_table = EXCLUDED.target_table, where_clause_template = EXCLUDED.where_clause_template;
-    """)
-
-    # Ensure staging index on (batch_id, group_code, key_no) for ultra-fast chunk status updates
-    cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_staging_lookup 
-        ON staging_deletion_item (batch_id, group_code, key_no);
     """)
 
     # 3. Seed orders
@@ -198,8 +193,8 @@ def phase2_generate_excel(target_file: str, total_keys: int = 100_000, dummy_key
     for i in range(1, dummy_keys_cnt + 1):
         keys.append(f"DUMMY-KEY-{i:04d}")
 
-    log(f"Creating DataFrame with {len(keys):,} keys ({valid_cnt:,} valid + {dummy_keys_cnt} dummy)...", "INFO")
-    df = pd.DataFrame({"order_no": keys})
+    log(f"Creating DataFrame with {len(keys):,} keys ({valid_cnt:,} valid + {dummy_keys_cnt} dummy) with key_type and key_no...", "INFO")
+    df = pd.DataFrame({"key_type": ["ORDER_NO"] * len(keys), "key_no": keys})
     
     log(f"Writing Excel file to {target_file}...", "INFO")
     df.to_excel(target_file, index=False, engine="openpyxl")
@@ -221,7 +216,6 @@ def phase3_ingest_excel(excel_file: str, batch_id: str, db_url: str, cur):
         ingest_script,
         "--file", excel_file,
         "--batch", batch_id,
-        "--group", "ORDERS",
         "--db-url", db_url,
     ]
     
@@ -240,28 +234,23 @@ def phase3_ingest_excel(excel_file: str, batch_id: str, db_url: str, cur):
     cur.execute("SELECT count(*) FROM staging_deletion_item WHERE batch_id = %s;", (batch_id,))
     stg_cnt = cur.fetchone()[0]
     assert_val(stg_cnt, 100_000, "staging_deletion_item row count")
-    
-    cur.execute("SELECT status, count(*) FROM staging_deletion_item WHERE batch_id = %s GROUP BY status;", (batch_id,))
-    status_dict = dict(cur.fetchall())
-    log(f"Staging Status Breakdown: {status_dict}", "INFO")
-    assert_val(status_dict.get("PENDING", 0), 100_000, "Initial PENDING count")
 
 
 def phase4_dry_run(batch_id: str, cur):
     log(f"=== PHASE 4: Executing Analytical Dry Run ({batch_id}) ===", "INFO")
     
     tracker.start("dry_run")
-    cur.execute("CALL run_data_deletion_dry_run(%s, 'ORDERS');", (batch_id,))
+    cur.execute("CALL run_data_deletion_dry_run(%s);", (batch_id,))
     t_dry_run = tracker.stop("dry_run")
     
     log(f"Dry Run procedure completed in {t_dry_run:.2f}s", "PERF")
 
-    # Check Staging status
-    cur.execute("SELECT status, count(*) FROM staging_deletion_item WHERE batch_id = %s GROUP BY status;", (batch_id,))
-    stg_status = dict(cur.fetchall())
-    log(f"Post Dry Run Staging Status: {stg_status}", "INFO")
-    assert_val(stg_status.get("NOT_FOUND", 0), 10, "NOT_FOUND keys (dummy keys)")
-    assert_val(stg_status.get("VALIDATED", 0), 99_990, "VALIDATED keys")
+    # Check Staging Task status
+    cur.execute("SELECT status, count(*) FROM staging_deletion_task WHERE batch_id = %s GROUP BY status;", (batch_id,))
+    task_status = dict(cur.fetchall())
+    log(f"Post Dry Run Task Status: {task_status}", "INFO")
+    assert_val(task_status.get("NOT_FOUND", 0), 10, "NOT_FOUND tasks (dummy keys)")
+    assert_val(task_status.get("VALIDATED", 0), 99_990, "VALIDATED tasks")
 
     # Check Dry Run Summary Table
     cur.execute("""
@@ -286,17 +275,17 @@ def phase5_real_deletion(batch_id: str, cur):
     log(f"Configuration: chunk_size={chunk_size}, throttle_sec={throttle_sec}s", "INFO")
     
     tracker.start("real_deletion")
-    cur.execute("CALL run_data_deletion(%s, 'ORDERS');", (batch_id,))
+    cur.execute("CALL run_data_deletion(%s);", (batch_id,))
     t_del = tracker.stop("real_deletion")
 
     log(f"Real Deletion completed in {t_del:.2f}s", "PERF")
 
-    # Verify staging final status
-    cur.execute("SELECT status, count(*) FROM staging_deletion_item WHERE batch_id = %s GROUP BY status;", (batch_id,))
-    stg_final = dict(cur.fetchall())
-    log(f"Final Staging Status: {stg_final}", "PASS")
-    assert_val(stg_final.get("COMPLETED", 0), 99_990, "Completed keys count")
-    assert_val(stg_final.get("NOT_FOUND", 0), 10, "NOT_FOUND keys unchanged")
+    # Verify staging task final status
+    cur.execute("SELECT status, count(*) FROM staging_deletion_task WHERE batch_id = %s GROUP BY status;", (batch_id,))
+    task_final = dict(cur.fetchall())
+    log(f"Final Task Status: {task_final}", "PASS")
+    assert_val(task_final.get("COMPLETED", 0), 99_990, "Completed tasks count")
+    assert_val(task_final.get("NOT_FOUND", 0), 10, "NOT_FOUND tasks unchanged")
 
     # Verify Audit Log
     cur.execute("""
@@ -335,7 +324,7 @@ def phase5_real_deletion(batch_id: str, cur):
 def phase6_post_maintenance(cur):
     log("=== PHASE 6: Post-Maintenance (VACUUM ANALYZE) ===", "INFO")
     
-    tables = ["orders", "order_items", "order_item_logs", "staging_deletion_item", "deletion_audit_log"]
+    tables = ["orders", "order_items", "order_item_logs", "staging_deletion_item", "staging_deletion_task", "deletion_audit_log"]
     tracker.start("vacuum_analyze")
     for tbl in tables:
         t0 = time.perf_counter()
@@ -415,13 +404,14 @@ This performance test benchmarks the **Yearly Data Deletion System** under high-
 - **Order Item Logs Table**: 1,000,000 rows with foreign key checking
 
 ### Phase 2: Excel (.xlsx) Key Generation & Ingestion
-- Generated **100,000 rows** in `{t_xl:.2f}s` (0.60 MB).
+- Generated **100,000 rows** in `{t_xl:.2f}s` (0.60 MB) with columns `key_type` and `key_no`.
 - Ingested via Python CLI in `{t_ingest:.2f}s` (throughput: `{100_000 / max(t_ingest, 0.001):,.0f} keys/s`).
-- All 100,000 keys loaded into `staging_deletion_item` with initial status `PENDING`.
+- All 100,000 keys loaded into `staging_deletion_item` as master keys.
 
-### Phase 3: Analytical Dry Run
+### Phase 3: Analytical Dry Run (Task Expansion & Validation)
+- Expanded 100,000 master items into `staging_deletion_task` based on matching `deletion_group` (`key_type = 'ORDER_NO'`).
 - Accurately flagged **10 dummy keys** as `NOT_FOUND` via `NOT EXISTS` check against `orders`.
-- Promoted **99,990 valid keys** to `VALIDATED`.
+- Promoted **99,990 valid tasks** to `VALIDATED`.
 - Accurately calculated estimated row count for all 3 levels:
   - `order_item_logs`: **99,990 rows**
   - `order_items`: **99,990 rows**
@@ -437,7 +427,7 @@ This performance test benchmarks the **Yearly Data Deletion System** under high-
   - `orders` remaining rows: **900,010**
   - `order_items` remaining rows: **900,010**
   - `order_item_logs` remaining rows: **900,010**
-  - Staging final status: **99,990 COMPLETED, 10 NOT_FOUND**
+  - Task final status: **99,990 COMPLETED, 10 NOT_FOUND**
   - Audit trail entries: **200 chunks logged per table (600 total audit records)**.
 
 ---
@@ -448,8 +438,8 @@ This performance test benchmarks the **Yearly Data Deletion System** under high-
    - For 100,000 keys, increasing `chunk_size` from 500 to **1,000** reduces the number of transactions from 200 to 100, cutting throttle overhead by 50%.
 2. **Throttle Configuration**:
    - In environments without read replicas or during designated maintenance windows, setting `throttle_sec = 0` will reduce total deletion time by ~10 seconds.
-3. **Staging Index**:
-   - The composite index `idx_staging_lookup ON staging_deletion_item (batch_id, group_code, key_no)` provides instant `UPDATE ... WHERE key_no = ANY(...)` resolution across 100K staging rows.
+3. **Task Lookup Index**:
+   - The composite index `idx_staging_task_lookup ON staging_deletion_task (batch_id, group_code, key_no)` provides instant `UPDATE ... WHERE key_no = ANY(...)` resolution across 100K task rows.
 """)
 
 

@@ -1,5 +1,6 @@
 # Operational Manual: Yearly Data Deletion System
 ### Standard Operating Procedure (SOP), Monitoring & Troubleshooting Guide
+### Version 2.0 (2-Tier Item & Task Architecture)
 
 ---
 
@@ -7,7 +8,7 @@
 
 | บทบาท | หน้าที่ |
 |---|---|
-| **Data Owner / Ops Team** | จัดเตรียมไฟล์ Excel/CSV ที่ผ่านการคัดกรอง Key ที่ครบกำหนดลบประจำปี |
+| **Data Owner / Ops Team** | จัดเตรียมไฟล์ Excel/CSV ที่มีคอลัมน์ `key_type` และ `key_no` ซึ่งผ่านการคัดกรอง Key ที่ครบกำหนดลบประจำปี |
 | **Database Administrator (DBA)** | รัน Pre-flight Check, ตรวจสอบ Replication & Disk, Monitor ขณะ Execution และรัน Post-Maintenance |
 | **Approver / Business Manager** | ตรวจสอบตัวเลขจาก `deletion_dry_run_summary` และลงนามอนุมัติ (Sign-off) ก่อนสั่งลบจริง |
 
@@ -27,7 +28,7 @@ SELECT
 FROM pg_constraint c
 WHERE c.contype = 'f'
   AND c.conrelid::regclass::text IN (
-      SELECT target_table FROM deletion_rule WHERE group_code = 'ORDERS'
+      SELECT target_table FROM deletion_rule
   )
   AND NOT EXISTS (
       SELECT 1 FROM pg_index i
@@ -46,7 +47,7 @@ JOIN information_schema.referential_constraints rc ON tc.constraint_name = rc.co
 JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name
 JOIN information_schema.constraint_column_usage ccu ON rc.unique_constraint_name = ccu.constraint_name
 WHERE rc.delete_rule = 'CASCADE'
-  AND ccu.table_name IN (SELECT target_table FROM deletion_rule WHERE group_code = 'ORDERS');
+  AND ccu.table_name IN (SELECT target_table FROM deletion_rule);
 ```
 
 - [ ] **4. Autovacuum Setting (สำหรับงานระดับแสน-ล้านแถว):**
@@ -66,48 +67,95 @@ ALTER TABLE order_item_logs SET (autovacuum_vacuum_scale_factor = 0.05);
 รันสคริปต์ `ingest.py` โดยระบุไฟล์และชื่อ Batch:
 
 ```bash
+# แบบที่ 1: ไฟล์ Excel/CSV ที่มีคอลัมน์ key_type และ key_no อยู่แล้ว (แนะนำ - Auto-detect):
 python scripts/ingest.py \
   --file /path/to/yearly_deletion_2025.xlsx \
+  --batch BATCH-2025
+
+# แบบที่ 2: ไฟล์ที่มีคอลัมน์เดียว (ระบุ key_type ผ่าน CLI):
+python scripts/ingest.py \
+  --file /path/to/orders_2024.csv \
   --batch BATCH-2025 \
-  --group ORDERS \
-  --db-url postgresql://postgres:password123@localhost:5432/deletion_db
+  --key-type ORDER_NO
 ```
 
 **ตรวจสอบความเรียบร้อย:**
 ```sql
-SELECT batch_id, group_code, status, COUNT(*) 
+-- ตรวจสอบ Master Keys ใน staging_deletion_item
+SELECT batch_id, key_type, COUNT(*) 
 FROM staging_deletion_item 
 WHERE batch_id = 'BATCH-2025' 
-GROUP BY batch_id, group_code, status;
+GROUP BY batch_id, key_type;
 ```
-*(ผลลัพธ์ควรแสดงจำนวนแถวตรงกับไฟล์ และมี status = `'PENDING'`)*
+*(ผลลัพธ์ควรแสดงจำนวนแถวตรงกับไฟล์ตามแต่ละ `key_type`)*
 
 ---
 
 ### Step 2: ประมวลผลจำลอง (Analytical Dry Run)
 
-รัน Procedure สำหรับ Dry Run — **สามารถรันทุกกลุ่มงานในคำสั่งเดียวได้ทันที**:
+รัน Procedure สำหรับ Dry Run — **ระบบจะทำการ Task Expansion (1:N) แตกงานลง `staging_deletion_task` และตรวจสอบความมีอยู่ของข้อมูลกับ Target Table ของกลุ่มนั้นโดยตรง (Root Rule) อัตโนมัติ**:
 ```sql
--- [แนะนำ] รันจำลองทุกกลุ่มงานใน Batch นี้ในคำสั่งเดียว:
+-- [แนะนำ] รันจำลองทุก Key Type และทุกกลุ่มตารางใน Batch นี้ในคำสั่งเดียว:
 CALL run_data_deletion_dry_run('BATCH-2025');
 
--- หรือรันเฉพาะกลุ่มเจาะจง:
-CALL run_data_deletion_dry_run('BATCH-2025', 'ORDERS');
+-- หรือรันเฉพาะ Key Type เจาะจง:
+CALL run_data_deletion_dry_run('BATCH-2025', 'ORDER_NO');
+
+-- หรือรันเฉพาะกลุ่มตารางเจาะจง:
+CALL run_data_deletion_dry_run('BATCH-2025', NULL, 'ORDERS');
 ```
 
-**ตรวจสอบผลลัพธ์:**
-```sql
--- 1. ดูผลสรุปจำนวนแถวที่จะถูกลบแยกตามกลุ่มงาน
-SELECT group_code, target_table, execution_order, estimated_rows_to_delete 
-FROM deletion_dry_run_summary 
-WHERE batch_id = 'BATCH-2025' 
-ORDER BY group_code, execution_order;
+**คำสั่งตรวจสอบผลลัพธ์อัตโนมัติ (Verification Reports for Dry Run):**
+สามารถสั่งรันสคริปต์รายงาน [`sql/05_report_verify_dry_run.sql`](file:///c:/KK/Workspace/AntigravityProject/data-deletion/sql/05_report_verify_dry_run.sql) เพื่อดูผลลัพธ์ครบทั้ง 5 หัวข้อในคราวเดียว:
+```bash
+psql -h localhost -U postgres -d deletion_db -v target_batch='BATCH-2025' -f sql/05_report_verify_dry_run.sql
+```
 
--- 2. ดูสถานะของ Keys แยกตามกลุ่มงาน
-SELECT group_code, status, COUNT(*) 
-FROM staging_deletion_item 
-WHERE batch_id = 'BATCH-2025' 
-GROUP BY group_code, status;
+#### ตัวอย่างผลลัพธ์รายงาน Dry Run (Target Table Level):
+
+**Report 1: Ingestion & Target Table Mapping Verification**
+```text
+  target_table   | execution_order | key_type | master_keys_count | mapped_tasks_count |          ingested_at          
+-----------------+-----------------+----------+-------------------+--------------------+-------------------------------
+ order_item_logs |               1 | ORDER_NO |              1002 |               1002 | 2026-09-20 06:11:59.848219+00
+ order_items     |               2 | ORDER_NO |              1002 |               1002 | 2026-09-20 06:11:59.848219+00
+ orders          |               3 | ORDER_NO |              1002 |               1002 | 2026-09-20 06:11:59.848219+00
+```
+
+**Report 2: Task Validation Summary & Match Rate (per Target Table)**
+```text
+  target_table   | execution_order | total_tasks | valid_matched_keys | not_found_keys | pending_tasks | match_rate_pct 
+-----------------+-----------------+-------------+--------------------+----------------+---------------+----------------
+ order_item_logs |               1 |        1002 |               1000 |              2 |             0 |          99.80
+ order_items     |               2 |        1002 |               1000 |              2 |             0 |          99.80
+ orders          |               3 |        1002 |               1000 |              2 |             0 |          99.80
+```
+
+**Report 3: Exception List: Missing Keys (`NOT_FOUND` List per Root Target Table)**
+*(ส่งรายการนี้กลับให้ Data Owner ตรวจสอบว่าคีย์พิมพ์ผิดหรือถูกลบไปแล้ว)*
+```text
+ root_target_table | key_type |   key_no    |  status   |          created_at           
+-------------------+----------+-------------+-----------+-------------------------------
+ orders            | ORDER_NO | DUMMY-99901 | NOT_FOUND | 2026-09-20 06:11:59.899821+00
+ orders            | ORDER_NO | DUMMY-99902 | NOT_FOUND | 2026-09-20 06:11:59.899821+00
+```
+
+**Report 4: Bottom-Up Estimated Rows to Delete (per Target Table)**
+```text
+  target_table   | execution_order | estimated_rows_to_delete |         estimated_at          
+-----------------+-----------------+--------------------------+-------------------------------
+ order_item_logs |               1 |                     1000 | 2026-09-20 06:11:59.899821+00
+ order_items     |               2 |                     1000 | 2026-09-20 06:11:59.899821+00
+ orders          |               3 |                     1000 | 2026-09-20 06:11:59.899821+00
+```
+
+**Report 5: Formal Executive Sign-off Summary (Target Table Level)**
+```text
+         batch_id         |  target_table   | execution_order | key_types | total_master_keys | valid_matched_keys | not_found_keys | match_rate_pct | estimated_rows_to_purge 
+--------------------------+-----------------+-----------------+-----------+-------------------+--------------------+----------------+----------------+-------------------------
+ TEST-PIPELINE-1789884718 | order_item_logs |               1 | ORDER_NO  |              1002 |               1000 |              2 |          99.80 |                    1000
+ TEST-PIPELINE-1789884718 | order_items     |               2 | ORDER_NO  |              1002 |               1000 |              2 |          99.80 |                    1000
+ TEST-PIPELINE-1789884718 | orders          |               3 | ORDER_NO  |              1002 |               1000 |              2 |          99.80 |                    1000
 ```
 
 ---
@@ -122,7 +170,8 @@ Export ข้อมูลจากตาราง `deletion_dry_run_summary` ส
 YEARLY DATA DELETION SIGN-OFF REQUEST
 =====================================================
 Batch ID:         BATCH-2025
-Groups Processed: ORDERS, INVOICES
+Key Types:        CUSTOMER_ID, ORDER_NO
+Groups Target:    ORDERS, INVOICES
 Simulation Date:  2026-09-20 10:00:00
 
 ESTIMATED ROWS TO BE PURGED:
@@ -136,7 +185,7 @@ ESTIMATED ROWS TO BE PURGED:
 2. invoices        (Parent):       1,000 rows
 
 TOTAL ROWS PURGED ACROSS ALL GROUPS: 23,000 rows
-NOT FOUND KEYS:                           0 keys
+NOT FOUND KEYS (DETECTED & SKIPPED):     10 keys
 
 Approved by: ________________________
 Date:        ________________________
@@ -150,10 +199,10 @@ Date:        ________________________
 เมื่อได้รับอนุมัติแล้ว ให้รันคำสั่งลบจริง — **สามารถสั่งลบทุกกลุ่มงานในคำสั่งเดียวได้ทันที**:
 
 ```sql
--- [แนะนำ] สั่งลบทุกกลุ่มงานใน Batch นี้ในคำสั่งเดียว:
+-- [แนะนำ] สั่งลบทุกกลุ่มตารางใน Batch นี้ในคำสั่งเดียว:
 CALL run_data_deletion('BATCH-2025');
 
--- หรือสั่งลบเฉพาะกลุ่มที่ต้องการ:
+-- หรือสั่งลบเฉพาะกลุ่มตารางที่ต้องการ:
 CALL run_data_deletion('BATCH-2025', 'ORDERS');
 
 -- หรือสั่งลบเฉพาะตารางลูกชั้นล่างก่อน (Granular Mode):
@@ -162,22 +211,60 @@ CALL run_data_deletion('BATCH-2025', 'ORDERS', 1); -- ลบเฉพาะ Gran
 
 ---
 
-### Step 5: ตรวจสอบผลลัพธ์หลังการลบ (Post-Audit)
+### Step 5: ตรวจสอบผลลัพธ์หลังการลบ (Post-Audit & Reconciliation)
 
-```sql
--- 1. ตรวจสอบสถานะ Staging
-SELECT status, COUNT(*) 
-FROM staging_deletion_item 
-WHERE batch_id = 'BATCH-2025' 
-GROUP BY status;
--- ควรได้ COMPLETED ครบทั้งหมด
+**คำสั่งตรวจสอบผลลัพธ์อัตโนมัติ (Verification Reports for Real Deletion):**
+สามารถสั่งรันสคริปต์รายงาน [`sql/06_report_verify_real_deletion.sql`](file:///c:/KK/Workspace/AntigravityProject/data-deletion/sql/06_report_verify_real_deletion.sql) เพื่อตรวจสอบความถูกต้องครบทั้ง 5 หัวข้อ:
+```bash
+psql -h localhost -U postgres -d deletion_db -v target_batch='BATCH-2025' -f sql/06_report_verify_real_deletion.sql
+```
 
--- 2. ตรวจสอบจำนวนแถวที่ลบจริงใน Audit Log
-SELECT target_table, SUM(deleted_row_count) AS total_deleted 
-FROM deletion_audit_log 
-WHERE batch_id = 'BATCH-2025' 
-GROUP BY target_table;
--- ตัวเลขควรตรงกับ estimated_rows_to_delete ใน Dry Run Summary
+#### ตัวอย่างผลลัพธ์รายงาน Real Deletion Verification (Target Table Level):
+
+**Report 1: Task Execution Progress & Completion Audit (per Target Table)**
+*(ยืนยันว่างานเสร็จสิ้น 100% ไม่มีงานค้างและไม่มี error รายตาราง)*
+```text
+  target_table   | execution_order | total_tasks | completed_tasks | remaining_tasks | skipped_not_found | failed_errors | progress_pct |    execution_status    
+-----------------+-----------------+-------------+-----------------+-----------------+-------------------+---------------+--------------+------------------------
+ order_item_logs |               1 |        1002 |            1000 |               0 |                 2 |             0 |       100.00 | PASSED: 100% COMPLETED
+ order_items     |               2 |        1002 |            1000 |               0 |                 2 |             0 |       100.00 | PASSED: 100% COMPLETED
+ orders          |               3 |        1002 |            1000 |               0 |                 2 |             0 |       100.00 | PASSED: 100% COMPLETED
+```
+
+**Report 2: 100% Reconciliation & Variance Report (Dry Run vs Actual Deleted)**
+*(เกณฑ์ผ่าน: ค่า variance ต้องเป็น 0 เสมอ และได้สถานะ MATCH 100%)*
+```text
+         batch_id         |  target_table   | exec_order | dry_run_estimated | actual_deleted | variance | reconciliation_status 
+--------------------------+-----------------+------------+-------------------+----------------+----------+-----------------------
+ TEST-PIPELINE-1789884718 | order_item_logs |          1 |              1000 |           1000 |        0 | MATCH (100%)
+ TEST-PIPELINE-1789884718 | order_items     |          2 |              1000 |           1000 |        0 | MATCH (100%)
+ TEST-PIPELINE-1789884718 | orders          |          3 |              1000 |           1000 |        0 | MATCH (100%)
+```
+
+**Report 3: Zero-Leakage Residual Sanity Check (Target Table Level)**
+*(ยืนยันว่าไม่มีแถวข้อมูลของคีย์ที่สั่งลบหลงเหลืออยู่ในตารางหลัก)*
+```text
+         batch_id         | target_table | completed_keys_checked | leaked_residual_keys |   sanity_status    
+--------------------------+--------------+------------------------+----------------------+--------------------
+ TEST-PIPELINE-1789884718 | orders       |                   1000 |                    0 | CLEAN (0 RESIDUAL)
+```
+
+**Report 4: Deletion Throughput & Performance Summary (per Target Table)**
+```text
+  target_table   | chunk_batches | total_rows_deleted |        first_chunk_at         |         last_chunk_at         | duration_seconds | rows_per_second 
+-----------------+---------------+--------------------+-------------------------------+-------------------------------+------------------+-----------------
+ order_item_logs |             2 |               1000 | 2026-09-20 06:12:00.073984+00 | 2026-09-20 06:12:00.199333+00 |             0.13 |         7977.73
+ order_items     |             2 |               1000 | 2026-09-20 06:12:00.073984+00 | 2026-09-20 06:12:00.199333+00 |             0.13 |         7977.73
+ orders          |             2 |               1000 | 2026-09-20 06:12:00.073984+00 | 2026-09-20 06:12:00.199333+00 |             0.13 |         7977.73
+```
+
+**Report 5: Compliance Certificate of Destruction / Audit Trail (Target Table Level)**
+```text
+         batch_id         |  target_table   | execution_order | total_purged_rows |       purge_started_at        |      purge_completed_at       | completed_keys_count | missing_keys_count 
+--------------------------+-----------------+-----------------+-------------------+-------------------------------+-------------------------------+----------------------+--------------------
+ TEST-PIPELINE-1789884718 | order_item_logs |               1 |              1000 | 2026-09-20 06:12:00.073984+00 | 2026-09-20 06:12:00.199333+00 |                 1000 |                  2
+ TEST-PIPELINE-1789884718 | order_items     |               2 |              1000 | 2026-09-20 06:12:00.073984+00 | 2026-09-20 06:12:00.199333+00 |                 1000 |                  2
+ TEST-PIPELINE-1789884718 | orders          |               3 |              1000 | 2026-09-20 06:12:00.073984+00 | 2026-09-20 06:12:00.199333+00 |                 1000 |                  2
 ```
 
 ---
@@ -189,6 +276,8 @@ GROUP BY target_table;
 VACUUM ANALYZE order_item_logs;
 VACUUM ANALYZE order_items;
 VACUUM ANALYZE orders;
+VACUUM ANALYZE staging_deletion_item;
+VACUUM ANALYZE staging_deletion_task;
 
 -- Reset Autovacuum กลับสู่ค่าเดิม
 ALTER TABLE orders RESET (autovacuum_vacuum_scale_factor);
@@ -200,16 +289,18 @@ ALTER TABLE order_item_logs RESET (autovacuum_vacuum_scale_factor);
 
 ## 4. Monitoring ระหว่างการลบ (Observability Queries)
 
-### 4.1 ตรวจสอบความคืบหน้าราย Chunk
+### 4.1 ตรวจสอบความคืบหน้าราย Chunk จากตาราง Task
 ```sql
--- ดูจำนวน keys ที่ทำเสร็จแล้วเทียบกับที่เหลือ
+-- ดูจำนวน tasks ที่ทำเสร็จแล้วเทียบกับที่เหลือ
 SELECT 
+    group_code,
     status,
     COUNT(*) AS count,
-    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS percentage
-FROM staging_deletion_item 
+    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (PARTITION BY group_code), 2) AS percentage
+FROM staging_deletion_task 
 WHERE batch_id = 'BATCH-2025' 
-GROUP BY status;
+GROUP BY group_code, status
+ORDER BY group_code, status;
 ```
 
 ### 4.2 ตรวจสอบ Throughput การลบใน Audit Log
@@ -246,13 +337,13 @@ FROM pg_stat_replication;
 - **สถานการณ์:** Connection หลุดขณะกำลังรันที่ Chunk 120 จาก 400 Chunks
 - **สถานะระบบ:** 
   - Chunk ที่ 1 ถึง 119 ถูก `COMMIT;` ไปแล้ว และบันทึกลง Audit Log ครบถ้วน
-  - Chunk ที่ 120 ที่ยังไม่เสร็จถูก PostgreSQL `ROLLBACK;` อัตโนมัติ Keys ของ Chunk นั้นยังคงสถานะ `VALIDATED`
+  - Chunk ที่ 120 ที่ยังไม่เสร็จถูก PostgreSQL `ROLLBACK;` อัตโนมัติ Tasks ของ Chunk นั้นใน `staging_deletion_task` ยังคงสถานะ `VALIDATED`
 - **แนวทางแก้ไข:**
   - รันคำสั่งเดิมซ้ำทันที:
     ```sql
     CALL run_data_deletion('BATCH-2025', 'ORDERS');
     ```
-  - ระบบจะดึงเฉพาะรายการที่ยังคงเป็น `VALIDATED` มาทำต่อจนจบโดยอัตโนมัติ (Zero Duplicate Deletion)
+  - ระบบจะดึงเฉพาะรายการที่ยังคงเป็น `VALIDATED` ใน `staging_deletion_task` มาทำต่อจนจบโดยอัตโนมัติ (Zero Duplicate Deletion)
 
 ---
 
@@ -261,7 +352,7 @@ FROM pg_stat_replication;
 - **อาการ:** Procedure หยุดทำงานทันที และพ่น Error Message
 - **แนวทางตรวจสอบ:**
   1. ดู Chunk ล่าสุดที่ทำสำเร็จใน `deletion_audit_log`
-  2. ตรวจสอบว่ามี Table หรือ Key ใดที่ตกหล่นจาก Rule หรือไม่
+  2. ตรวจสอบ Tasks ที่ค้างใน `staging_deletion_task WHERE status = 'VALIDATED'`
   3. เมื่อแก้ปัญหาที่ Schema/Rule เรียบร้อยแล้ว สั่งรัน `CALL run_data_deletion(...)` อีกครั้งเพื่อทำงานต่อ
 
 ---

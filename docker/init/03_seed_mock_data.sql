@@ -27,8 +27,8 @@ SELECT
 FROM generate_series(1, 60000) AS g;
 
 -- 4. Configure Deletion Group
-INSERT INTO deletion_group (group_code, description, chunk_size, throttle_sec, parent_table, parent_key_col)
-VALUES ('ORDERS', 'Yearly order data deletion', 500, 0.05, 'orders', 'order_no');
+INSERT INTO deletion_group (group_code, key_type, description, chunk_size, throttle_sec)
+VALUES ('ORDERS', 'ORDER_NO', 'Yearly order data deletion', 500, 0.05);
 
 -- 5. Configure Deletion Rules (Bottom-Up: Grandchild → Child → Parent)
 INSERT INTO deletion_rule (group_code, target_table, execution_order, where_clause_template)

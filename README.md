@@ -17,22 +17,25 @@
 
 ---
 
-## 🏗️ Architecture
+## 🏗️ Architecture (2-Tier Item & Task Model)
 
 ```
-[Excel/CSV File]
+[Excel/CSV File (key_type, key_no)]
        │
        ▼
-[Python ingest.py] ──► [staging_deletion_item]
+[Python ingest.py] ──► [staging_deletion_item] (Master Keys)
                               │
-              ┌───────────────┴───────────────┐
-              ▼                               ▼
-     Phase 1: Dry Run                Phase 2: Real Delete
-     (COUNT only, no delete)         (Bottom-Up, chunked COMMIT)
-              │                               │
-              ▼                               ▼
-     [dry_run_summary]               [deletion_audit_log]
-     → ส่ง Ops อนุมัติ               → หลักฐาน Audit Trail
+               ┌──────────────┴──────────────┐
+               ▼ Task Expansion (1:N)        ▼
+      [staging_deletion_task] (Tasks per Table Group)
+               │                             │
+               ▼                             ▼
+      Phase 1: Dry Run              Phase 2: Real Delete
+      (NOT_FOUND / VALIDATED)       (Bottom-Up, chunked COMMIT)
+               │                             │
+               ▼                             ▼
+      [dry_run_summary]             [deletion_audit_log]
+      → ส่ง Ops อนุมัติ             → หลักฐาน Audit Trail
 ```
 
 ---
@@ -50,10 +53,19 @@ data-deletion/
 │       └── 04_create_procedures.sql # Dry Run & Real Delete procedures
 │
 ├── sql/                             # Production SQL Scripts
-│   ├── 01_core_schema.sql           # Framework schema (CREATE TABLE IF NOT EXISTS)
+│   ├── 01_core_schema.sql           # Framework schema (2-Tier architecture)
 │   ├── 02_dry_run.sql               # Procedure: run_data_deletion_dry_run
 │   ├── 03_real_deletion.sql         # Procedure: run_data_deletion
-│   └── 04_preflight_checks.sql      # Safety checks (FK Index, CASCADE)
+│   ├── 04_preflight_checks.sql      # Safety checks (FK Index, CASCADE)
+│   ├── 05_report_verify_dry_run.sql # Verification reports for Dry Run (Target Table level)
+│   ├── 06_report_verify_real_deletion.sql # Verification reports for Real Deletion (Target Table level)
+│   └── 07_example_configurations.sql# Enterprise configuration examples for 6 use cases
+│
+├── docs/                            # Comprehensive Documentation
+│   ├── CONFIG_USE_CASES_GUIDE.md    # Guide for configuring groups & rules across use cases
+│   ├── OPERATIONAL_MANUAL.md        # SOP, checklists, disaster recovery & verification reports
+│   ├── TECHNICAL_SPEC.md            # Technical specification, sequence diagram & architecture
+│   └── PERFORMANCE_REPORT_1M_100K.md# Benchmark report (1M records, 100K Excel keys)
 │
 ├── scripts/                         # Python Tools
 │   ├── ingest.py                    # CSV/XLSX → staging_deletion_item
@@ -90,13 +102,13 @@ pip install -r scripts/requirements.txt
 ```
 
 ### 3. Ingest Keys
-
+ 
 ```bash
-# จาก CSV
-python scripts/ingest.py --file mock_data/sample_keys.csv --batch BATCH-2025 --group ORDERS
+# จาก CSV หรือ Excel ที่มีคอลัมน์ key_type และ key_no อยู่แล้ว (Auto-detect)
+python scripts/ingest.py --file data.xlsx --batch BATCH-2025
 
-# จาก Excel
-python scripts/ingest.py --file data.xlsx --batch BATCH-2025 --group ORDERS
+# หรือระบุ --key-type สำหรับไฟล์ที่มีคอลัมน์เดียว
+python scripts/ingest.py --file mock_data/sample_keys.csv --batch BATCH-2025 --key-type ORDER_NO
 ```
 
 ### 4. Dry Run (จำลอง ไม่ลบจริง)

@@ -1,6 +1,6 @@
 -- =============================================
 -- Phase 2: Real Deletion (Bottom-Up Safe, Granular)
--- Supports running a single group or ALL groups in a batch
+-- Supports 2-Tier Item & Task Model
 -- =============================================
 
 CREATE OR REPLACE PROCEDURE run_data_deletion(
@@ -22,13 +22,13 @@ DECLARE
     v_sql           TEXT;
     v_groups_run    INT := 0;
 BEGIN
-    -- Iterate through all active groups with VALIDATED keys in this batch
+    -- Iterate through all active groups with VALIDATED tasks in this batch
     FOR v_grp IN (
         SELECT DISTINCT g.group_code, g.chunk_size, g.throttle_sec
-        FROM staging_deletion_item s
-        JOIN deletion_group g ON g.group_code = s.group_code
-        WHERE s.batch_id = p_batch_id
-          AND s.status = 'VALIDATED'
+        FROM staging_deletion_task t
+        JOIN deletion_group g ON g.group_code = t.group_code
+        WHERE t.batch_id = p_batch_id
+          AND t.status = 'VALIDATED'
           AND g.is_active = TRUE
           AND (p_group_code IS NULL OR g.group_code = p_group_code)
         ORDER BY g.group_code
@@ -55,10 +55,10 @@ BEGIN
 
         -- Chunk processing loop for this group
         LOOP
-            -- Fetch next chunk of VALIDATED keys
+            -- Fetch next chunk of VALIDATED keys from staging_deletion_task
             SELECT ARRAY(
                 SELECT key_no 
-                FROM staging_deletion_item
+                FROM staging_deletion_task
                 WHERE batch_id = p_batch_id 
                   AND group_code = v_grp.group_code 
                   AND status = 'VALIDATED'
@@ -102,13 +102,13 @@ BEGIN
                     v_deleted_count, v_rule.target_table;
             END LOOP;
 
-            -- Always update staging status to prevent infinite loop
+            -- Always update task status to prevent infinite loop
             IF v_max_order = (SELECT MAX(execution_order) FROM deletion_rule WHERE group_code = v_grp.group_code) THEN
-                UPDATE staging_deletion_item
+                UPDATE staging_deletion_task
                 SET status = 'COMPLETED', processed_at = CURRENT_TIMESTAMP
                 WHERE batch_id = p_batch_id AND group_code = v_grp.group_code AND key_no = ANY(v_chunk_keys);
             ELSE
-                UPDATE staging_deletion_item
+                UPDATE staging_deletion_task
                 SET status = 'PARTIAL_COMPLETED', processed_at = CURRENT_TIMESTAMP
                 WHERE batch_id = p_batch_id AND group_code = v_grp.group_code AND key_no = ANY(v_chunk_keys);
             END IF;
@@ -126,7 +126,7 @@ BEGIN
     END LOOP;
 
     IF v_groups_run = 0 THEN
-        RAISE NOTICE 'No VALIDATED items found for Batch "%" (Filter: %)',
+        RAISE NOTICE 'No VALIDATED tasks found for Batch "%" (Filter: %)',
             p_batch_id, COALESCE(p_group_code, 'ALL');
     ELSE
         RAISE NOTICE '==================================================';

@@ -1,20 +1,23 @@
 -- =============================================
 -- Yearly Data Deletion Framework - Core Schema
+-- Docker Initialization Script (2-Tier Item & Task Model)
 -- =============================================
 
--- 1. Deletion Group (Configuration)
+-- 1. Deletion Group (Table Group Configuration)
 CREATE TABLE deletion_group (
     group_code VARCHAR(50) PRIMARY KEY,
+    key_type VARCHAR(50) NOT NULL,  -- Key Type accepted by this table group (e.g. ORDER_NO, CUSTOMER_ID)
     description TEXT,
     chunk_size INT NOT NULL DEFAULT 500,
     throttle_sec NUMERIC(4,2) NOT NULL DEFAULT 0.05,
-    parent_table VARCHAR(100),
-    parent_key_col VARCHAR(100),
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- 2. Deletion Rule (Unified WHERE Clause)
+CREATE INDEX idx_deletion_group_key_type 
+ON deletion_group (key_type, is_active);
+
+-- 2. Deletion Rule (Unified WHERE Clause for both COUNT and DELETE)
 CREATE TABLE deletion_rule (
     id SERIAL PRIMARY KEY,
     group_code VARCHAR(50) NOT NULL REFERENCES deletion_group(group_code),
@@ -24,25 +27,40 @@ CREATE TABLE deletion_rule (
     UNIQUE(group_code, execution_order)
 );
 
--- 3. Staging Table (Keys from Excel/CSV)
+-- 3. Staging Item Table (Master Keys from Excel/CSV)
 CREATE TABLE staging_deletion_item (
     id BIGSERIAL PRIMARY KEY,
     batch_id VARCHAR(50) NOT NULL,
-    group_code VARCHAR(50) NOT NULL REFERENCES deletion_group(group_code),
+    key_type VARCHAR(50) NOT NULL,
+    key_no VARCHAR(100) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(batch_id, key_type, key_no)
+);
+
+CREATE INDEX idx_staging_item_lookup 
+ON staging_deletion_item (batch_id, key_type);
+
+-- 4. Staging Task Table (Execution Tasks per Table Group)
+CREATE TABLE staging_deletion_task (
+    id BIGSERIAL PRIMARY KEY,
+    batch_id VARCHAR(50) NOT NULL,
+    item_id BIGINT NOT NULL REFERENCES staging_deletion_item(id) ON DELETE CASCADE,
+    group_code VARCHAR(50) NOT NULL REFERENCES deletion_group(group_code) ON DELETE CASCADE,
     key_no VARCHAR(100) NOT NULL,
     status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
     error_message TEXT,
     processed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(batch_id, group_code, key_no)
 );
 
-CREATE INDEX idx_staging_fetch 
-ON staging_deletion_item (group_code, batch_id, status, id);
+CREATE INDEX idx_staging_task_fetch 
+ON staging_deletion_task (group_code, batch_id, status, id);
 
-CREATE INDEX idx_staging_lookup 
-ON staging_deletion_item (batch_id, group_code, key_no);
+CREATE INDEX idx_staging_task_lookup 
+ON staging_deletion_task (batch_id, group_code, key_no);
 
--- 4. Dry Run Summary
+-- 5. Dry Run Summary
 CREATE TABLE deletion_dry_run_summary (
     id BIGSERIAL PRIMARY KEY,
     batch_id VARCHAR(50) NOT NULL,
@@ -53,7 +71,7 @@ CREATE TABLE deletion_dry_run_summary (
     executed_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- 5. Audit Log
+-- 6. Audit Log
 CREATE TABLE deletion_audit_log (
     id BIGSERIAL PRIMARY KEY,
     batch_id VARCHAR(50) NOT NULL,
